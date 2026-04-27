@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -225,6 +226,26 @@ class SyncBackendTests(unittest.TestCase):
             self.assertEqual(result["default_selected_thread_ids"][0], "old-24")
             self.assertEqual(result["default_selected_thread_ids"][-1], "old-05")
             self.assertEqual(result["candidates"][0]["title"], "Old thread 24")
+            self.assertTrue(result["candidates"][0]["can_sync"])
+
+    def test_candidate_list_can_include_current_threads_as_read_only_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home)
+            create_ordered_threads_db(codex_home, count=25)
+            paths = resolve_paths(str(codex_home))
+
+            result = get_sync_candidates(paths, limit=30, include_current=True)
+
+            self.assertEqual(result["total_threads"], 26)
+            self.assertEqual(result["total_candidates"], 25)
+            self.assertEqual(result["current_count"], 1)
+            self.assertEqual(result["total_displayed"], 26)
+            self.assertEqual(result["candidates"][0]["id"], "already-current")
+            self.assertFalse(result["candidates"][0]["can_sync"])
+            self.assertEqual(result["candidates"][0]["status"], "当前")
+            self.assertEqual(result["default_selected_thread_ids"][0], "old-24")
+            self.assertNotIn("already-current", result["default_selected_thread_ids"])
 
     def test_candidate_list_default_limit_is_one_thousand_and_newest_first(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -242,6 +263,114 @@ class SyncBackendTests(unittest.TestCase):
             self.assertEqual(result["candidates"][-1]["id"], "old-05")
             self.assertEqual(result["default_selected_thread_ids"][0], "old-1004")
             self.assertEqual(result["default_selected_thread_ids"][-1], "old-985")
+
+    def test_candidate_list_uses_updated_time_before_created_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home)
+            conn = sqlite3.connect(codex_home / "state_5.sqlite")
+            conn.execute(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    model_provider TEXT NOT NULL,
+                    model TEXT,
+                    title TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    created_at_ms INTEGER,
+                    updated_at_ms INTEGER,
+                    rollout_path TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO threads
+                    (id, model_provider, model, title, cwd, created_at, updated_at, created_at_ms, updated_at_ms, rollout_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("created-today", "new_provider", "gpt-old", "Created today", "E:\\App\\demo", 3000, 8000, 3000000, 8000000, None),
+                    ("continued-today", "new_provider", "gpt-old", "Continued today", "E:\\App\\demo", 1000, 9000, 1000000, 9000000, None),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            paths = resolve_paths(str(codex_home))
+
+            result = get_sync_candidates(paths, limit=2)
+
+            self.assertEqual([row["id"] for row in result["candidates"]], ["continued-today", "created-today"])
+
+    def test_candidate_list_uses_rollout_modified_time_like_codex_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home)
+            plugin_newer_rollout = write_rollout(codex_home, "plugin-newer", "new_provider", "gpt-old")
+            db_newer_rollout = write_rollout(codex_home, "db-newer", "new_provider", "gpt-old")
+            os.utime(plugin_newer_rollout, (12000, 12000))
+            os.utime(db_newer_rollout, (11000, 11000))
+            conn = sqlite3.connect(codex_home / "state_5.sqlite")
+            conn.execute(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    model_provider TEXT NOT NULL,
+                    model TEXT,
+                    title TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    created_at_ms INTEGER,
+                    updated_at_ms INTEGER,
+                    rollout_path TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO threads
+                    (id, model_provider, model, title, cwd, created_at, updated_at, created_at_ms, updated_at_ms, rollout_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "plugin-newer",
+                        "new_provider",
+                        "gpt-old",
+                        "Plugin newer",
+                        "E:\\App\\demo",
+                        1000,
+                        8000,
+                        1000000,
+                        8000000,
+                        str(plugin_newer_rollout),
+                    ),
+                    (
+                        "db-newer",
+                        "new_provider",
+                        "gpt-old",
+                        "DB newer",
+                        "E:\\App\\demo",
+                        1000,
+                        9000,
+                        1000000,
+                        9000000,
+                        str(db_newer_rollout),
+                    ),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            paths = resolve_paths(str(codex_home))
+
+            result = get_sync_candidates(paths, limit=2)
+
+            self.assertEqual([row["id"] for row in result["candidates"]], ["plugin-newer", "db-newer"])
+            self.assertEqual(result["candidates"][0]["activity_source"], "rollout_mtime")
+            self.assertEqual(result["candidates"][0]["activity_at_ms"], 12000000)
 
     def test_sync_only_updates_selected_thread_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

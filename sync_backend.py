@@ -218,19 +218,53 @@ def add_thread_id_filter(
     return f"({where_sql}) AND id IN ({placeholders})", [*params, *selected_ids]
 
 
-def newest_thread_sort_expression(columns: set[str]) -> str:
-    parts = []
-    if "updated_at_ms" in columns:
-        parts.append("updated_at_ms")
-    if "updated_at" in columns:
-        parts.append("updated_at * 1000")
-    if "created_at_ms" in columns:
-        parts.append("created_at_ms")
-    if "created_at" in columns:
-        parts.append("created_at * 1000")
-    if not parts:
-        return "id"
-    return f"COALESCE({', '.join(parts)}, 0)"
+def resolve_rollout_path(paths: Paths, rollout_path: str | None) -> Path | None:
+    if not rollout_path:
+        return None
+    path = Path(rollout_path)
+    return path if path.is_absolute() else paths.codex_home / path
+
+
+def thread_activity_time_ms(row: dict[str, object]) -> int:
+    for key, multiplier in (
+        ("updated_at_ms", 1),
+        ("updated_at", 1000),
+        ("created_at_ms", 1),
+        ("created_at", 1000),
+    ):
+        value = row.get(key)
+        if value is not None:
+            return int(value) * multiplier
+    return 0
+
+
+def rollout_modified_time_ms(paths: Paths, rollout_path: str | None) -> int | None:
+    path = resolve_rollout_path(paths, rollout_path)
+    if path is None:
+        return None
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return None
+
+
+def apply_thread_activity_time(paths: Paths, row: dict[str, object]) -> dict[str, object]:
+    rollout_time_ms = rollout_modified_time_ms(paths, row.get("rollout_path"))
+    if rollout_time_ms is not None:
+        row["activity_at_ms"] = rollout_time_ms
+        row["activity_source"] = "rollout_mtime"
+    else:
+        row["activity_at_ms"] = thread_activity_time_ms(row)
+        row["activity_source"] = "thread_metadata"
+    return row
+
+
+def is_sync_candidate_row(row: dict[str, object], current_provider: str, current_model: str | None, columns: set[str]) -> bool:
+    if row.get("model_provider") != current_provider:
+        return True
+    if "model" in columns and current_model and row.get("model") != current_model:
+        return True
+    return False
 
 
 def optional_column(columns: set[str], column: str) -> str:
@@ -240,15 +274,17 @@ def optional_column(columns: set[str], column: str) -> str:
 def query_sync_candidates(
     conn: sqlite3.Connection,
     *,
+    paths: Paths,
     current_provider: str,
     current_model: str | None,
     columns: set[str],
     limit: int | None = DEFAULT_CANDIDATE_LIST_LIMIT,
+    include_current: bool = False,
 ) -> list[dict[str, object]]:
     if limit is not None and limit <= 0:
         return []
-    where_sql, params = build_sync_candidate_condition(current_provider, current_model, columns)
-    sort_expression = newest_thread_sort_expression(columns)
+    candidate_where_sql, params = build_sync_candidate_condition(current_provider, current_model, columns)
+    where_sql = "1 = 1" if include_current else candidate_where_sql
     select_parts = [
         "id",
         optional_column(columns, "title"),
@@ -265,29 +301,43 @@ def query_sync_candidates(
         SELECT {', '.join(select_parts)}
         FROM threads
         WHERE {where_sql}
-        ORDER BY {sort_expression} DESC, id DESC
+        ORDER BY id DESC
     """
-    query_params: list[object] = [*params]
-    if limit is not None:
-        sql += " LIMIT ?"
-        query_params.append(limit)
+    query_params: list[object] = [] if include_current else [*params]
 
     rows = []
     for row in conn.execute(sql, query_params):
+        thread_row = {
+            "id": str(row[0]),
+            "title": str(row[1]) if row[1] else "",
+            "model_provider": str(row[2]) if row[2] is not None else None,
+            "model": str(row[3]) if row[3] is not None else None,
+            "cwd": str(row[4]) if row[4] is not None else None,
+            "created_at": int(row[5]) if row[5] is not None else None,
+            "updated_at": int(row[6]) if row[6] is not None else None,
+            "created_at_ms": int(row[7]) if row[7] is not None else None,
+            "updated_at_ms": int(row[8]) if row[8] is not None else None,
+            "rollout_path": str(row[9]) if row[9] is not None else None,
+        }
+        can_sync = is_sync_candidate_row(thread_row, current_provider, current_model, columns)
+        thread_row["can_sync"] = can_sync
+        thread_row["status"] = "可同步" if can_sync else "当前"
         rows.append(
-            {
-                "id": str(row[0]),
-                "title": str(row[1]) if row[1] else "",
-                "model_provider": str(row[2]) if row[2] is not None else None,
-                "model": str(row[3]) if row[3] is not None else None,
-                "cwd": str(row[4]) if row[4] is not None else None,
-                "created_at": int(row[5]) if row[5] is not None else None,
-                "updated_at": int(row[6]) if row[6] is not None else None,
-                "created_at_ms": int(row[7]) if row[7] is not None else None,
-                "updated_at_ms": int(row[8]) if row[8] is not None else None,
-                "rollout_path": str(row[9]) if row[9] is not None else None,
-            }
+            apply_thread_activity_time(
+                paths,
+                thread_row,
+            )
         )
+    rows.sort(
+        key=lambda row: (
+            int(row["activity_at_ms"]) if row.get("activity_at_ms") is not None else 0,
+            thread_activity_time_ms(row),
+            str(row["id"]),
+        ),
+        reverse=True,
+    )
+    if limit is not None:
+        return rows[:limit]
     return rows
 
 
@@ -514,7 +564,15 @@ def count_sync_candidates(
     return int(conn.execute(f"SELECT COUNT(*) FROM threads WHERE {where_sql}", params).fetchone()[0])
 
 
-def get_sync_candidates(paths: Paths, limit: int = DEFAULT_CANDIDATE_LIST_LIMIT) -> dict[str, object]:
+def count_threads(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
+
+
+def get_sync_candidates(
+    paths: Paths,
+    limit: int = DEFAULT_CANDIDATE_LIST_LIMIT,
+    include_current: bool = False,
+) -> dict[str, object]:
     ensure_environment(paths)
     config_text = read_text(paths.config_path)
     current_provider = parse_current_provider(config_text)
@@ -528,20 +586,31 @@ def get_sync_candidates(paths: Paths, limit: int = DEFAULT_CANDIDATE_LIST_LIMIT)
             current_model=current_model,
             columns=columns,
         )
+        total_threads = count_threads(conn)
         candidates = query_sync_candidates(
             conn,
+            paths=paths,
             current_provider=current_provider,
             current_model=current_model,
             columns=columns,
             limit=limit,
+            include_current=include_current,
         )
 
-    default_selected = [row["id"] for row in candidates[:DEFAULT_SELECTED_CANDIDATES]]
+    default_selected = [
+        row["id"]
+        for row in candidates
+        if row.get("can_sync")
+    ][:DEFAULT_SELECTED_CANDIDATES]
     return {
         "action": "list-candidates",
         "current_provider": current_provider,
         "current_model": current_model,
+        "include_current": include_current,
+        "total_threads": total_threads,
         "total_candidates": total_candidates,
+        "current_count": total_threads - total_candidates,
+        "total_displayed": len(candidates),
         "default_selected_count": len(default_selected),
         "default_selected_thread_ids": default_selected,
         "limit": limit,
@@ -972,6 +1041,7 @@ def main() -> int:
     subparsers.add_parser("status", help="Show current provider/thread status")
     candidates_parser = subparsers.add_parser("list-candidates", help="List threads that can be moved to current settings")
     candidates_parser.add_argument("--limit", type=int, default=DEFAULT_CANDIDATE_LIST_LIMIT)
+    candidates_parser.add_argument("--include-current", action="store_true", help="Include current provider/model threads as read-only rows")
     sync_parser = subparsers.add_parser("sync", help="Move selected thread providers/models to the current settings")
     sync_parser.add_argument("--thread-id", action="append", help="Thread id to sync; repeat for multiple threads")
     sync_parser.add_argument("--latest", type=int, help="Sync the newest N candidate threads")
@@ -986,7 +1056,7 @@ def main() -> int:
         if args.command == "status":
             payload = get_status(paths)
         elif args.command == "list-candidates":
-            payload = get_sync_candidates(paths, limit=args.limit)
+            payload = get_sync_candidates(paths, limit=args.limit, include_current=args.include_current)
         elif args.command == "sync":
             if args.thread_id:
                 payload = sync_to_current_provider(paths, args.thread_id)

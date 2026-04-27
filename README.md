@@ -9,7 +9,8 @@
 - 查看当前本机 Codex 历史线程属于哪些 provider
 - 查看当前本机 Codex 历史线程属于哪些 model
 - 查看 SQLite 和 rollout 元数据是否不一致
-- 列出可找回的旧 provider / model 会话，按最近更新时间倒序排列
+- 列出可找回的旧 provider / model 会话，按 Codex 会话活动时间倒序排列
+- 图形界面会同时展示当前 provider / model 会话，但这些当前会话只读展示、不可勾选同步
 - 图形界面一次最多加载 1000 个可找回会话，默认勾选最新 20 个
 - 把选中的旧会话同步到当前设置，同时同步匹配线程的 rollout `session_meta`
 - 在同步前自动创建数据库和受影响 rollout 文件快照
@@ -63,7 +64,9 @@ py -3 .\sync_backend.py --json status
 py -3 .\sync_backend.py --json list-candidates --limit 1000
 ```
 
-如果不传 `--limit`，默认也会返回最多 1000 条。返回结果按最近更新时间倒序排列，也就是最近更新的会话排在最上面。
+如果不传 `--limit`，默认也会返回最多 1000 条。返回结果优先按 rollout 会话文件的最后修改时间倒序排列，尽量跟 Codex 会话列表的顺序保持一致；没有对应 rollout 文件时再退回 SQLite 会话时间。
+
+图形界面会使用 `--include-current` 展示完整会话视图：旧 provider / model 会话标记为“可同步”，当前 provider / model 会话标记为“当前”并禁止勾选。
 
 ### 同步最新 20 个可找回会话
 
@@ -114,7 +117,7 @@ py -3 -m unittest discover -s tests -v
 ## 使用建议
 
 - 执行同步或恢复前请先关闭 Codex Desktop；如果 Codex 同时运行，它可能继续写入数据库，导致同步不完整或恢复结果被覆盖
-- 图形界面默认加载最多 1000 个可找回会话，按最近更新时间倒序排列，并默认只勾选最新 20 个
+- 图形界面默认加载最多 1000 个会话行，按 Codex 会话活动时间倒序排列，并默认只勾选最新 20 个可同步会话
 - 图形界面的“全选最多1000”只会勾选当前列表里已经加载出来的会话；如果你的可找回会话超过 1000 条，请用命令行 `py -3 .\sync_backend.py --json sync` 执行全量同步
 - 只想同步最近一批时，可以用命令行 `py -3 .\sync_backend.py --json sync --latest N`，例如 `--latest 50`
 - 如果同步完成后历史列表没有立刻刷新，重开一次 Codex Desktop 即可

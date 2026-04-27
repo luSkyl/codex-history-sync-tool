@@ -16,9 +16,22 @@ $script:ShortcutName = 'Codex 对话同步工具.lnk'
 $script:IconLocation = 'C:\Windows\System32\imageres.dll,15'
 $script:BackupMap = @{}
 $script:CandidateMap = @{}
+$script:CandidateRows = @()
+$script:CandidateCheckedIds = @{}
 $script:LatestState = $null
 $script:LatestCandidates = $null
 $script:CandidateListLimit = 1000
+$script:ColorPage = [System.Drawing.Color]::FromArgb(244, 247, 248)
+$script:ColorSurface = [System.Drawing.Color]::White
+$script:ColorText = [System.Drawing.Color]::FromArgb(23, 33, 43)
+$script:ColorMuted = [System.Drawing.Color]::FromArgb(102, 112, 133)
+$script:ColorBorder = [System.Drawing.Color]::FromArgb(216, 224, 229)
+$script:ColorPrimary = [System.Drawing.Color]::FromArgb(15, 118, 110)
+$script:ColorPrimaryDark = [System.Drawing.Color]::FromArgb(17, 94, 89)
+$script:ColorWarning = [System.Drawing.Color]::FromArgb(180, 83, 9)
+$script:ColorDanger = [System.Drawing.Color]::FromArgb(180, 35, 24)
+$script:ColorCurrentRow = [System.Drawing.Color]::FromArgb(238, 246, 245)
+$script:ColorDisabledText = [System.Drawing.Color]::FromArgb(152, 162, 179)
 
 function Invoke-Backend {
   param(
@@ -110,7 +123,9 @@ function Format-ThreadTime {
   param($Row)
 
   $milliseconds = $null
-  if ($Row.updated_at_ms) {
+  if ($Row.activity_at_ms) {
+    $milliseconds = [int64]$Row.activity_at_ms
+  } elseif ($Row.updated_at_ms) {
     $milliseconds = [int64]$Row.updated_at_ms
   } elseif ($Row.updated_at) {
     $milliseconds = [int64]$Row.updated_at * 1000
@@ -146,32 +161,119 @@ function Shorten-Text {
   return $normalized.Substring(0, $MaxLength - 1) + '…'
 }
 
-function Refresh-Candidates {
-  $candidates = Invoke-Backend @('--json', 'list-candidates', '--limit', ([string]$script:CandidateListLimit))
-  $script:LatestCandidates = $candidates
-  $candidateList.Items.Clear()
-  $script:CandidateMap = @{}
+function Normalize-SearchText {
+  param([AllowNull()][string]$Text)
 
-  $defaultIds = @{}
-  foreach ($id in @($candidates.default_selected_thread_ids)) {
-    $defaultIds[[string]$id] = $true
+  if (-not $Text) {
+    return ''
   }
 
-  foreach ($row in @($candidates.candidates)) {
-    $timeText = Format-ThreadTime $row
-    $modelText = if ($row.model) { [string]$row.model } else { '(empty)' }
-    $titleText = Shorten-Text $row.title
-    $cwdText = Shorten-Text $row.cwd 28
-    $shortId = ([string]$row.id).Substring(0, [Math]::Min(8, ([string]$row.id).Length))
-    $label = "$timeText  [$modelText]  $titleText  @$cwdText  #$shortId"
-    $script:CandidateMap[$label] = [string]$row.id
-    $index = $candidateList.Items.Add($label)
-    if ($defaultIds.ContainsKey([string]$row.id)) {
-      $candidateList.SetItemChecked($index, $true)
+  return (($Text -replace '\s+', ' ').Trim()).ToLowerInvariant()
+}
+
+function Test-CandidateMatchesSearch {
+  param($Row)
+
+  $query = Normalize-SearchText $candidateSearchBox.Text
+  if (-not $query) {
+    return $true
+  }
+
+  $haystack = Normalize-SearchText "$($Row.status) $($Row.title) $($Row.cwd) $($Row.model) $($Row.model_provider) $($Row.id)"
+  return $haystack.Contains($query)
+}
+
+function Sync-CandidateChecksFromView {
+  if (-not $candidateList) {
+    return
+  }
+
+  foreach ($item in $candidateList.Items) {
+    $threadId = [string]$item.Tag
+    if (-not $threadId) {
+      continue
+    }
+    $row = $script:CandidateMap[$threadId]
+    if ($item.Checked -and $row -and $row.can_sync) {
+      $script:CandidateCheckedIds[$threadId] = $true
+    } else {
+      $script:CandidateCheckedIds.Remove($threadId)
     }
   }
+}
 
-  $candidateSummaryLabel.Text = "可找回会话: $($candidates.total_candidates)    默认选中最新: $($candidates.default_selected_count)    当前列表: $($candidateList.Items.Count)/最多$($candidates.limit)    排序: 最近在上"
+function Render-Candidates {
+  Sync-CandidateChecksFromView
+  $candidateList.BeginUpdate()
+  try {
+    $candidateList.Items.Clear()
+    $script:CandidateMap = @{}
+
+    foreach ($row in @($script:CandidateRows)) {
+      if (-not (Test-CandidateMatchesSearch $row)) {
+        continue
+      }
+
+      $threadId = [string]$row.id
+      $timeText = Format-ThreadTime $row
+      $modelText = if ($row.model) { [string]$row.model } else { '(empty)' }
+      $statusText = if ($row.can_sync) { '可同步' } else { '当前' }
+      $titleText = Shorten-Text $row.title 56
+      $cwdText = Shorten-Text $row.cwd 42
+      $sourceText = if ($row.activity_source -eq 'rollout_mtime') { 'rollout' } else { 'db' }
+      $shortId = $threadId.Substring(0, [Math]::Min(8, $threadId.Length))
+
+      $item = New-Object System.Windows.Forms.ListViewItem('')
+      $item.Tag = $threadId
+      $item.Checked = $row.can_sync -and $script:CandidateCheckedIds.ContainsKey($threadId)
+      if (-not $row.can_sync) {
+        $item.BackColor = $script:ColorCurrentRow
+        $item.ForeColor = $script:ColorDisabledText
+      }
+      [void]$item.SubItems.Add($statusText)
+      [void]$item.SubItems.Add($timeText)
+      [void]$item.SubItems.Add($modelText)
+      [void]$item.SubItems.Add($titleText)
+      [void]$item.SubItems.Add($cwdText)
+      [void]$item.SubItems.Add($sourceText)
+      [void]$item.SubItems.Add($shortId)
+      $item.ToolTipText = "$($row.title)`r`n$($row.cwd)`r`n$threadId"
+
+      $script:CandidateMap[$threadId] = $row
+      [void]$candidateList.Items.Add($item)
+    }
+  } finally {
+    $candidateList.EndUpdate()
+  }
+
+  Update-CandidateSummary
+}
+
+function Update-CandidateSummary {
+  $selectedCount = $script:CandidateCheckedIds.Count
+  $visibleCount = if ($candidateList) { $candidateList.Items.Count } else { 0 }
+  $totalCount = if ($script:LatestCandidates) { $script:LatestCandidates.total_candidates } else { 0 }
+  $currentCount = if ($script:LatestCandidates) { $script:LatestCandidates.current_count } else { 0 }
+  $threadCount = if ($script:LatestCandidates) { $script:LatestCandidates.total_threads } else { $totalCount }
+  $limit = if ($script:LatestCandidates) { $script:LatestCandidates.limit } else { $script:CandidateListLimit }
+  $candidateSummaryLabel.Text = "全部: $threadCount    可同步: $totalCount    当前: $currentCount    显示: $visibleCount/$limit    已选: $selectedCount"
+  if ($candidateCountValueLabel) {
+    $candidateCountValueLabel.Text = "$threadCount / $totalCount"
+    $candidateCountDetailLabel.Text = "全部 / 可同步，已选 $selectedCount"
+  }
+}
+
+function Refresh-Candidates {
+  $candidates = Invoke-Backend @('--json', 'list-candidates', '--limit', ([string]$script:CandidateListLimit), '--include-current')
+  $script:LatestCandidates = $candidates
+  $script:CandidateRows = @($candidates.candidates)
+  $script:CandidateCheckedIds = @{}
+
+  foreach ($id in @($candidates.default_selected_thread_ids)) {
+    $script:CandidateCheckedIds[[string]$id] = $true
+  }
+
+  Render-Candidates
 }
 
 function Select-DefaultCandidates {
@@ -179,33 +281,41 @@ function Select-DefaultCandidates {
     return
   }
 
-  $defaultIds = @{}
+  $script:CandidateCheckedIds = @{}
   foreach ($id in @($script:LatestCandidates.default_selected_thread_ids)) {
-    $defaultIds[[string]$id] = $true
+    $script:CandidateCheckedIds[[string]$id] = $true
   }
-
-  for ($index = 0; $index -lt $candidateList.Items.Count; $index++) {
-    $label = [string]$candidateList.Items[$index]
-    $threadId = $script:CandidateMap[$label]
-    $candidateList.SetItemChecked($index, $defaultIds.ContainsKey($threadId))
-  }
+  Render-Candidates
 }
 
 function Set-AllCandidatesChecked {
   param([bool]$Checked)
 
-  for ($index = 0; $index -lt $candidateList.Items.Count; $index++) {
-    $candidateList.SetItemChecked($index, $Checked)
+  if (-not $Checked) {
+    $script:CandidateCheckedIds = @{}
   }
+
+  foreach ($item in $candidateList.Items) {
+    $threadId = [string]$item.Tag
+    $row = $script:CandidateMap[$threadId]
+    if ($Checked) {
+      if ($row -and $row.can_sync) {
+        $script:CandidateCheckedIds[$threadId] = $true
+        $item.Checked = $true
+      }
+    } else {
+      $script:CandidateCheckedIds.Remove($threadId)
+      $item.Checked = $false
+    }
+  }
+  Update-CandidateSummary
 }
 
 function Get-SelectedCandidateIds {
+  Sync-CandidateChecksFromView
   $ids = New-Object System.Collections.Generic.List[string]
-  foreach ($item in $candidateList.CheckedItems) {
-    $threadId = $script:CandidateMap[[string]$item]
-    if ($threadId) {
-      [void]$ids.Add([string]$threadId)
-    }
+  foreach ($threadId in $script:CandidateCheckedIds.Keys) {
+    [void]$ids.Add([string]$threadId)
   }
   return $ids.ToArray()
 }
@@ -214,10 +324,15 @@ function Refresh-State {
   $status = Invoke-Backend @('--json', 'status')
   $script:LatestState = $status
 
-  $providerLabel.Text = "当前 provider: $($status.current_provider)    需同步 provider 线程: $($status.provider_movable_threads)"
-  $modelLabel.Text = if ($status.current_model) { "当前模型: $($status.current_model)    需同步模型线程: $($status.model_movable_threads)" } else { '当前模型: 未读取到' }
-  $summaryLabel.Text = "线程总数: $($status.total_threads)    可同步线程: $($status.movable_threads)    Rollout文件: $($status.rollout_total)    DB/Rollout不一致: $($status.rollout_db_mismatch_threads)"
-  $pathLabel.Text = "数据库: $($status.db_path)"
+  $providerValueLabel.Text = [string]$status.current_provider
+  $providerDetailLabel.Text = "需同步 provider: $($status.provider_movable_threads)"
+  $modelValueLabel.Text = if ($status.current_model) { [string]$status.current_model } else { '未读取到' }
+  $modelDetailLabel.Text = "需同步模型: $($status.model_movable_threads)"
+  $candidateCountValueLabel.Text = [string]$status.movable_threads
+  $candidateCountDetailLabel.Text = "线程总数: $($status.total_threads)"
+  $rolloutValueLabel.Text = "$($status.rollout_total) 文件"
+  $rolloutDetailLabel.Text = "DB/Rollout 不一致: $($status.rollout_db_mismatch_threads)"
+  $pathLabel.Text = "数据库  $($status.db_path)"
 
   $providersView.Items.Clear()
   foreach ($row in $status.provider_counts) {
@@ -256,130 +371,200 @@ function Confirm-Action {
   return $choice -eq [System.Windows.Forms.DialogResult]::OK
 }
 
+function New-StatusCard {
+  param(
+    [string]$Title,
+    [int]$X
+  )
+
+  $panel = New-Object System.Windows.Forms.Panel
+  $panel.Location = New-Object System.Drawing.Point($X, 82)
+  $panel.Size = New-Object System.Drawing.Size(260, 76)
+  $panel.BackColor = $script:ColorSurface
+  $panel.BorderStyle = 'FixedSingle'
+  $form.Controls.Add($panel)
+
+  $titleLabel = New-Object System.Windows.Forms.Label
+  $titleLabel.Text = $Title
+  $titleLabel.AutoSize = $true
+  $titleLabel.ForeColor = $script:ColorMuted
+  $titleLabel.Location = New-Object System.Drawing.Point(12, 10)
+  $panel.Controls.Add($titleLabel)
+
+  $valueLabel = New-Object System.Windows.Forms.Label
+  $valueLabel.Text = '-'
+  $valueLabel.AutoSize = $false
+  $valueLabel.Size = New-Object System.Drawing.Size(232, 24)
+  $valueLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 12, [System.Drawing.FontStyle]::Bold)
+  $valueLabel.ForeColor = $script:ColorText
+  $valueLabel.Location = New-Object System.Drawing.Point(12, 30)
+  $panel.Controls.Add($valueLabel)
+
+  $detailLabel = New-Object System.Windows.Forms.Label
+  $detailLabel.Text = '-'
+  $detailLabel.AutoSize = $false
+  $detailLabel.Size = New-Object System.Drawing.Size(232, 18)
+  $detailLabel.ForeColor = $script:ColorMuted
+  $detailLabel.Location = New-Object System.Drawing.Point(12, 54)
+  $panel.Controls.Add($detailLabel)
+
+  return @{
+    Panel = $panel
+    Value = $valueLabel
+    Detail = $detailLabel
+  }
+}
+
+function Apply-ResponsiveLayout {
+  $left = 22
+  $right = 22
+  $gap = 14
+  $clientWidth = $form.ClientSize.Width
+  $clientHeight = $form.ClientSize.Height
+  $contentWidth = [Math]::Max(1016, $clientWidth - $left - $right)
+  $rightPanelWidth = 326
+  $mainTop = 246
+  $logHeight = 118
+  $bottom = 22
+  $mainHeight = [Math]::Max(360, $clientHeight - $mainTop - $logHeight - $gap - $bottom)
+  $rightX = $clientWidth - $right - $rightPanelWidth
+  $mainWidth = [Math]::Max(620, $rightX - $gap - $left)
+
+  $cardGap = 14
+  $cardTop = 82
+  $cardWidth = [Math]::Max(230, [Math]::Floor(($contentWidth - ($cardGap * 3)) / 4))
+  $statusCards = @($providerCard, $modelCard, $candidateCountCard, $rolloutCard)
+  for ($index = 0; $index -lt $statusCards.Count; $index++) {
+    $panel = $statusCards[$index]['Panel']
+    $panel.Location = New-Object System.Drawing.Point(($left + (($cardWidth + $cardGap) * $index)), $cardTop)
+    $panel.Size = New-Object System.Drawing.Size($cardWidth, 76)
+    $statusCards[$index]['Value'].Size = New-Object System.Drawing.Size(($cardWidth - 24), 24)
+    $statusCards[$index]['Detail'].Size = New-Object System.Drawing.Size(($cardWidth - 24), 18)
+  }
+
+  $pathLabel.MaximumSize = New-Object System.Drawing.Size($contentWidth, 0)
+  $candidateSearchBox.Size = New-Object System.Drawing.Size([Math]::Max(260, $rightX - 356 - $gap), 24)
+  $clearSearchButton.Location = New-Object System.Drawing.Point(($candidateSearchBox.Right + 10), 195)
+
+  $candidateBox.Location = New-Object System.Drawing.Point($left, $mainTop)
+  $candidateBox.Size = New-Object System.Drawing.Size($mainWidth, $mainHeight)
+  $candidateList.Size = New-Object System.Drawing.Size([Math]::Max(560, $candidateBox.ClientSize.Width - 24), [Math]::Max(220, $candidateBox.ClientSize.Height - 106))
+
+  $candidateList.Columns[0].Width = 34
+  $candidateList.Columns[1].Width = 70
+  $candidateList.Columns[2].Width = 135
+  $candidateList.Columns[3].Width = 150
+  $candidateList.Columns[4].Width = 420
+  $candidateList.Columns[5].Width = 460
+  $candidateList.Columns[6].Width = 76
+  $candidateList.Columns[7].Width = 120
+
+  $backupsBox.Location = New-Object System.Drawing.Point($rightX, $mainTop)
+  $backupsBox.Size = New-Object System.Drawing.Size($rightPanelWidth, 250)
+  $backupList.Size = New-Object System.Drawing.Size(($rightPanelWidth - 24), 116)
+
+  $providersBox.Location = New-Object System.Drawing.Point($rightX, ($backupsBox.Bottom + $gap))
+  $providersBox.Size = New-Object System.Drawing.Size($rightPanelWidth, [Math]::Max(150, $mainHeight - $backupsBox.Height - $gap))
+  $providersView.Size = New-Object System.Drawing.Size(($rightPanelWidth - 24), [Math]::Max(92, $providersBox.ClientSize.Height - 38))
+  $providersView.Columns[0].Width = 220
+  $providersView.Columns[1].Width = 90
+  $providersView.Columns[2].Width = 70
+
+  $logTop = $mainTop + $mainHeight + $gap
+  $logBox.Location = New-Object System.Drawing.Point($left, $logTop)
+  $logBox.Size = New-Object System.Drawing.Size($contentWidth, [Math]::Max(90, $clientHeight - $logTop - $bottom))
+}
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Codex 历史同步工具'
 $form.StartPosition = 'CenterScreen'
-$form.Size = New-Object System.Drawing.Size(980, 760)
-$form.MinimumSize = New-Object System.Drawing.Size(980, 760)
-$form.BackColor = [System.Drawing.Color]::FromArgb(247, 248, 250)
+$form.Size = New-Object System.Drawing.Size(1180, 860)
+$form.MinimumSize = New-Object System.Drawing.Size(1060, 760)
+$form.MaximizeBox = $true
+$form.BackColor = $script:ColorPage
 $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 
 $headerLabel = New-Object System.Windows.Forms.Label
 $headerLabel.Text = 'Codex 历史同步工具'
 $headerLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 16, [System.Drawing.FontStyle]::Bold)
 $headerLabel.AutoSize = $true
-$headerLabel.Location = New-Object System.Drawing.Point(20, 18)
+$headerLabel.ForeColor = $script:ColorText
+$headerLabel.Location = New-Object System.Drawing.Point(22, 14)
 $form.Controls.Add($headerLabel)
 
 $warningLabel = New-Object System.Windows.Forms.Label
 $warningLabel.Text = '请先关闭 Codex Desktop 再做同步或恢复；否则 Codex 可能同时写库，导致同步不完整或被覆盖。'
-$warningLabel.ForeColor = [System.Drawing.Color]::FromArgb(163, 64, 31)
+$warningLabel.ForeColor = $script:ColorWarning
 $warningLabel.AutoSize = $true
-$warningLabel.Location = New-Object System.Drawing.Point(22, 52)
+$warningLabel.Location = New-Object System.Drawing.Point(24, 48)
 $form.Controls.Add($warningLabel)
 
-$providerLabel = New-Object System.Windows.Forms.Label
-$providerLabel.Text = '当前 provider:'
-$providerLabel.AutoSize = $true
-$providerLabel.Location = New-Object System.Drawing.Point(22, 88)
-$form.Controls.Add($providerLabel)
+$providerCard = New-StatusCard '当前 Provider' 22
+$providerValueLabel = $providerCard['Value']
+$providerDetailLabel = $providerCard['Detail']
 
-$modelLabel = New-Object System.Windows.Forms.Label
-$modelLabel.Text = '当前模型:'
-$modelLabel.AutoSize = $true
-$modelLabel.Location = New-Object System.Drawing.Point(22, 112)
-$form.Controls.Add($modelLabel)
+$modelCard = New-StatusCard '当前模型' 296
+$modelValueLabel = $modelCard['Value']
+$modelDetailLabel = $modelCard['Detail']
 
-$summaryLabel = New-Object System.Windows.Forms.Label
-$summaryLabel.Text = '线程总数:'
-$summaryLabel.AutoSize = $true
-$summaryLabel.Location = New-Object System.Drawing.Point(22, 136)
-$form.Controls.Add($summaryLabel)
+$candidateCountCard = New-StatusCard '会话视图' 570
+$candidateCountValueLabel = $candidateCountCard['Value']
+$candidateCountDetailLabel = $candidateCountCard['Detail']
+
+$rolloutCard = New-StatusCard 'Rollout 状态' 844
+$rolloutValueLabel = $rolloutCard['Value']
+$rolloutDetailLabel = $rolloutCard['Detail']
 
 $pathLabel = New-Object System.Windows.Forms.Label
-$pathLabel.Text = '数据库:'
+$pathLabel.Text = '数据库'
 $pathLabel.AutoSize = $true
-$pathLabel.Location = New-Object System.Drawing.Point(22, 160)
-$pathLabel.MaximumSize = New-Object System.Drawing.Size(900, 0)
+$pathLabel.ForeColor = $script:ColorMuted
+$pathLabel.Location = New-Object System.Drawing.Point(24, 166)
+$pathLabel.MaximumSize = New-Object System.Drawing.Size(1080, 0)
 $form.Controls.Add($pathLabel)
 
 $refreshButton = New-Object System.Windows.Forms.Button
 $refreshButton.Text = '刷新状态'
 $refreshButton.Size = New-Object System.Drawing.Size(110, 34)
-$refreshButton.Location = New-Object System.Drawing.Point(22, 200)
+$refreshButton.Location = New-Object System.Drawing.Point(22, 194)
+$refreshButton.BackColor = $script:ColorSurface
 $form.Controls.Add($refreshButton)
 
 $syncButton = New-Object System.Windows.Forms.Button
 $syncButton.Text = '同步选中会话'
 $syncButton.Size = New-Object System.Drawing.Size(150, 34)
-$syncButton.Location = New-Object System.Drawing.Point(142, 200)
-$syncButton.BackColor = [System.Drawing.Color]::FromArgb(32, 91, 177)
+$syncButton.Location = New-Object System.Drawing.Point(144, 194)
+$syncButton.BackColor = $script:ColorPrimary
 $syncButton.ForeColor = [System.Drawing.Color]::White
 $syncButton.FlatStyle = 'Flat'
 $form.Controls.Add($syncButton)
 
-$backupButton = New-Object System.Windows.Forms.Button
-$backupButton.Text = '手动备份'
-$backupButton.Size = New-Object System.Drawing.Size(110, 34)
-$backupButton.Location = New-Object System.Drawing.Point(312, 200)
-$form.Controls.Add($backupButton)
+$searchLabel = New-Object System.Windows.Forms.Label
+$searchLabel.Text = '搜索'
+$searchLabel.AutoSize = $true
+$searchLabel.ForeColor = $script:ColorMuted
+$searchLabel.Location = New-Object System.Drawing.Point(316, 202)
+$form.Controls.Add($searchLabel)
 
-$openBackupsButton = New-Object System.Windows.Forms.Button
-$openBackupsButton.Text = '打开备份目录'
-$openBackupsButton.Size = New-Object System.Drawing.Size(120, 34)
-$openBackupsButton.Location = New-Object System.Drawing.Point(442, 200)
-$form.Controls.Add($openBackupsButton)
+$candidateSearchBox = New-Object System.Windows.Forms.TextBox
+$candidateSearchBox.Location = New-Object System.Drawing.Point(356, 198)
+$candidateSearchBox.Size = New-Object System.Drawing.Size(360, 24)
+$candidateSearchBox.BackColor = $script:ColorSurface
+$candidateSearchBox.ForeColor = $script:ColorText
+$form.Controls.Add($candidateSearchBox)
 
-$shortcutButton = New-Object System.Windows.Forms.Button
-$shortcutButton.Text = '重建桌面图标'
-$shortcutButton.Size = New-Object System.Drawing.Size(120, 34)
-$shortcutButton.Location = New-Object System.Drawing.Point(578, 200)
-$form.Controls.Add($shortcutButton)
-
-$providersBox = New-Object System.Windows.Forms.GroupBox
-$providersBox.Text = 'Provider 统计'
-$providersBox.Location = New-Object System.Drawing.Point(22, 252)
-$providersBox.Size = New-Object System.Drawing.Size(300, 145)
-$form.Controls.Add($providersBox)
-
-$providersView = New-Object System.Windows.Forms.ListView
-$providersView.View = 'Details'
-$providersView.FullRowSelect = $true
-$providersView.GridLines = $true
-$providersView.Location = New-Object System.Drawing.Point(12, 26)
-$providersView.Size = New-Object System.Drawing.Size(276, 107)
-[void]$providersView.Columns.Add('Provider', 140)
-[void]$providersView.Columns.Add('线程数', 70)
-[void]$providersView.Columns.Add('当前', 50)
-$providersBox.Controls.Add($providersView)
-
-$backupsBox = New-Object System.Windows.Forms.GroupBox
-$backupsBox.Text = '备份列表'
-$backupsBox.Location = New-Object System.Drawing.Point(342, 252)
-$backupsBox.Size = New-Object System.Drawing.Size(590, 145)
-$form.Controls.Add($backupsBox)
-
-$backupList = New-Object System.Windows.Forms.ListBox
-$backupList.Location = New-Object System.Drawing.Point(12, 24)
-$backupList.Size = New-Object System.Drawing.Size(566, 72)
-$backupsBox.Controls.Add($backupList)
-
-$restoreButton = New-Object System.Windows.Forms.Button
-$restoreButton.Text = '恢复选中备份'
-$restoreButton.Size = New-Object System.Drawing.Size(120, 32)
-$restoreButton.Location = New-Object System.Drawing.Point(12, 104)
-$backupsBox.Controls.Add($restoreButton)
-
-$restoreLatestButton = New-Object System.Windows.Forms.Button
-$restoreLatestButton.Text = '恢复最新备份'
-$restoreLatestButton.Size = New-Object System.Drawing.Size(120, 32)
-$restoreLatestButton.Location = New-Object System.Drawing.Point(146, 104)
-$backupsBox.Controls.Add($restoreLatestButton)
+$clearSearchButton = New-Object System.Windows.Forms.Button
+$clearSearchButton.Text = '清除'
+$clearSearchButton.Size = New-Object System.Drawing.Size(70, 30)
+$clearSearchButton.Location = New-Object System.Drawing.Point(728, 195)
+$clearSearchButton.BackColor = $script:ColorSurface
+$form.Controls.Add($clearSearchButton)
 
 $candidateBox = New-Object System.Windows.Forms.GroupBox
-$candidateBox.Text = '可找回会话'
-$candidateBox.Location = New-Object System.Drawing.Point(22, 410)
-$candidateBox.Size = New-Object System.Drawing.Size(910, 170)
+$candidateBox.Text = '会话列表'
+$candidateBox.ForeColor = $script:ColorText
+$candidateBox.Location = New-Object System.Drawing.Point(22, 246)
+$candidateBox.Size = New-Object System.Drawing.Size(770, 430)
 $form.Controls.Add($candidateBox)
 
 $candidateSummaryLabel = New-Object System.Windows.Forms.Label
@@ -388,39 +573,167 @@ $candidateSummaryLabel.AutoSize = $true
 $candidateSummaryLabel.Location = New-Object System.Drawing.Point(12, 24)
 $candidateBox.Controls.Add($candidateSummaryLabel)
 
-$candidateList = New-Object System.Windows.Forms.CheckedListBox
-$candidateList.CheckOnClick = $true
-$candidateList.HorizontalScrollbar = $true
-$candidateList.Location = New-Object System.Drawing.Point(12, 48)
-$candidateList.Size = New-Object System.Drawing.Size(886, 76)
-$candidateBox.Controls.Add($candidateList)
-
 $selectDefaultButton = New-Object System.Windows.Forms.Button
 $selectDefaultButton.Text = '默认最新20'
 $selectDefaultButton.Size = New-Object System.Drawing.Size(100, 30)
-$selectDefaultButton.Location = New-Object System.Drawing.Point(12, 132)
+$selectDefaultButton.Location = New-Object System.Drawing.Point(12, 54)
+$selectDefaultButton.BackColor = $script:ColorSurface
 $candidateBox.Controls.Add($selectDefaultButton)
 
 $selectAllButton = New-Object System.Windows.Forms.Button
-$selectAllButton.Text = '全选最多1000'
-$selectAllButton.Size = New-Object System.Drawing.Size(110, 30)
-$selectAllButton.Location = New-Object System.Drawing.Point(124, 132)
+$selectAllButton.Text = '全选当前列表'
+$selectAllButton.Size = New-Object System.Drawing.Size(118, 30)
+$selectAllButton.Location = New-Object System.Drawing.Point(124, 54)
+$selectAllButton.BackColor = $script:ColorSurface
 $candidateBox.Controls.Add($selectAllButton)
 
 $clearSelectionButton = New-Object System.Windows.Forms.Button
 $clearSelectionButton.Text = '清空选择'
 $clearSelectionButton.Size = New-Object System.Drawing.Size(90, 30)
-$clearSelectionButton.Location = New-Object System.Drawing.Point(246, 132)
+$clearSelectionButton.Location = New-Object System.Drawing.Point(254, 54)
+$clearSelectionButton.BackColor = $script:ColorSurface
 $candidateBox.Controls.Add($clearSelectionButton)
+
+$candidateList = New-Object System.Windows.Forms.ListView
+$candidateList.View = 'Details'
+$candidateList.CheckBoxes = $true
+$candidateList.FullRowSelect = $true
+$candidateList.GridLines = $true
+$candidateList.HideSelection = $false
+$candidateList.ShowItemToolTips = $true
+$candidateList.Scrollable = $true
+$candidateList.BackColor = $script:ColorSurface
+$candidateList.ForeColor = $script:ColorText
+$candidateList.Location = New-Object System.Drawing.Point(12, 94)
+$candidateList.Size = New-Object System.Drawing.Size(746, 320)
+[void]$candidateList.Columns.Add('', 34)
+[void]$candidateList.Columns.Add('状态', 64)
+[void]$candidateList.Columns.Add('时间', 120)
+[void]$candidateList.Columns.Add('模型', 120)
+[void]$candidateList.Columns.Add('标题', 245)
+[void]$candidateList.Columns.Add('项目目录', 160)
+[void]$candidateList.Columns.Add('来源', 62)
+[void]$candidateList.Columns.Add('ID', 78)
+$candidateBox.Controls.Add($candidateList)
+
+$backupsBox = New-Object System.Windows.Forms.GroupBox
+$backupsBox.Text = '备份与恢复'
+$backupsBox.ForeColor = $script:ColorText
+$backupsBox.Location = New-Object System.Drawing.Point(814, 246)
+$backupsBox.Size = New-Object System.Drawing.Size(326, 250)
+$form.Controls.Add($backupsBox)
+
+$backupList = New-Object System.Windows.Forms.ListBox
+$backupList.Location = New-Object System.Drawing.Point(12, 24)
+$backupList.Size = New-Object System.Drawing.Size(302, 116)
+$backupList.HorizontalScrollbar = $true
+$backupList.BackColor = $script:ColorSurface
+$backupList.ForeColor = $script:ColorText
+$backupsBox.Controls.Add($backupList)
+
+$backupButton = New-Object System.Windows.Forms.Button
+$backupButton.Text = '手动备份'
+$backupButton.Size = New-Object System.Drawing.Size(94, 32)
+$backupButton.Location = New-Object System.Drawing.Point(12, 150)
+$backupButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($backupButton)
+
+$openBackupsButton = New-Object System.Windows.Forms.Button
+$openBackupsButton.Text = '打开目录'
+$openBackupsButton.Size = New-Object System.Drawing.Size(94, 32)
+$openBackupsButton.Location = New-Object System.Drawing.Point(114, 150)
+$openBackupsButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($openBackupsButton)
+
+$shortcutButton = New-Object System.Windows.Forms.Button
+$shortcutButton.Text = '重建图标'
+$shortcutButton.Size = New-Object System.Drawing.Size(94, 32)
+$shortcutButton.Location = New-Object System.Drawing.Point(216, 150)
+$shortcutButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($shortcutButton)
+
+$restoreButton = New-Object System.Windows.Forms.Button
+$restoreButton.Text = '恢复选中备份'
+$restoreButton.Size = New-Object System.Drawing.Size(144, 34)
+$restoreButton.Location = New-Object System.Drawing.Point(12, 196)
+$restoreButton.ForeColor = $script:ColorDanger
+$restoreButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($restoreButton)
+
+$restoreLatestButton = New-Object System.Windows.Forms.Button
+$restoreLatestButton.Text = '恢复最新备份'
+$restoreLatestButton.Size = New-Object System.Drawing.Size(144, 34)
+$restoreLatestButton.Location = New-Object System.Drawing.Point(168, 196)
+$restoreLatestButton.ForeColor = $script:ColorDanger
+$restoreLatestButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($restoreLatestButton)
+
+$providersBox = New-Object System.Windows.Forms.GroupBox
+$providersBox.Text = 'Provider 统计'
+$providersBox.ForeColor = $script:ColorText
+$providersBox.Location = New-Object System.Drawing.Point(814, 510)
+$providersBox.Size = New-Object System.Drawing.Size(326, 166)
+$form.Controls.Add($providersBox)
+
+$providersView = New-Object System.Windows.Forms.ListView
+$providersView.View = 'Details'
+$providersView.FullRowSelect = $true
+$providersView.GridLines = $true
+$providersView.Scrollable = $true
+$providersView.BackColor = $script:ColorSurface
+$providersView.ForeColor = $script:ColorText
+$providersView.Location = New-Object System.Drawing.Point(12, 26)
+$providersView.Size = New-Object System.Drawing.Size(302, 128)
+[void]$providersView.Columns.Add('Provider', 160)
+[void]$providersView.Columns.Add('线程数', 78)
+[void]$providersView.Columns.Add('当前', 54)
+$providersBox.Controls.Add($providersView)
 
 $logBox = New-Object System.Windows.Forms.TextBox
 $logBox.Multiline = $true
 $logBox.ScrollBars = 'Vertical'
 $logBox.ReadOnly = $true
-$logBox.Location = New-Object System.Drawing.Point(22, 595)
-$logBox.Size = New-Object System.Drawing.Size(910, 110)
-$logBox.BackColor = [System.Drawing.Color]::White
+$logBox.Location = New-Object System.Drawing.Point(22, 694)
+$logBox.Size = New-Object System.Drawing.Size(1118, 118)
+$logBox.BackColor = $script:ColorSurface
+$logBox.ForeColor = $script:ColorText
 $form.Controls.Add($logBox)
+
+$candidateSearchBox.Add_TextChanged({
+  if ($script:LatestCandidates) {
+    Render-Candidates
+  }
+})
+
+$clearSearchButton.Add_Click({
+  $candidateSearchBox.Text = ''
+})
+
+$candidateList.Add_ItemChecked({
+  Update-CandidateSummary
+})
+
+$candidateList.Add_ItemCheck({
+  param($Sender, $EventArgs)
+
+  $item = $candidateList.Items[$EventArgs.Index]
+  $threadId = [string]$item.Tag
+  $row = $script:CandidateMap[$threadId]
+  if ($row -and -not $row.can_sync -and $EventArgs.NewValue -eq [System.Windows.Forms.CheckState]::Checked) {
+    $EventArgs.NewValue = [System.Windows.Forms.CheckState]::Unchecked
+    Append-Log "当前会话不可同步，已跳过: $threadId"
+  }
+})
+
+$form.Add_Shown({
+  Apply-ResponsiveLayout
+})
+
+$form.Add_Resize({
+  if ($candidateBox -and $candidateList -and $logBox) {
+    Apply-ResponsiveLayout
+  }
+})
 
 $refreshButton.Add_Click({
   try {

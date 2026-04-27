@@ -9,3 +9,6 @@
 - 2026-04-26: Selective recovery should sort by `updated_at_ms`/`updated_at`; real data has 236 recoverable `Linghu` threads with old models, and the newest default 20 are all old-model candidates.
 - 2026-04-26: Candidate titles can contain characters outside the active Windows console encoding; JSON CLI output must use ASCII escapes so PowerShell can capture and `ConvertFrom-Json` reliably.
 - 2026-04-26: Codex can rewrite SQLite model values from rollout `turn_context.payload.model` and `turn_context.payload.collaboration_mode.settings.model`, not only `session_meta`; selective sync must update those structured fields too.
+- 2026-04-27: Candidate ordering regressed to prefer `created_at_ms`/`created_at` before `updated_at_ms`/`updated_at`, so conversations created yesterday but continued today could still display as yesterday and fail to sort to the top.
+- 2026-04-27: Codex plugin ordering aligns more closely with rollout file activity than with SQLite `updated_at`; candidate sorting should therefore prefer rollout file modification time and only fall back to SQLite timestamps when the file is missing.
+- 2026-04-27: Showing only sync candidates makes the UI diverge from the Codex session list and causes confusion; including current sessions as read-only rows preserves context while preventing accidental sync of already-current threads.
