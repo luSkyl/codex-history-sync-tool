@@ -1,0 +1,18 @@
+# Progress
+
+- 2026-04-26: SKILLS_TRACE using-superpowers -> issue-evidence-closure (assessment only) -> brainstorming -> backend-delivery -> planning-with-files -> cc-skill-coding-standards -> cc-skill-backend-patterns; implementation approved by user.
+- 2026-04-26: Existing tests passed before changes: `py -3 -m unittest discover -s tests -v`.
+- 2026-04-26: Implemented rollout-aware sync, snapshot backup/restore, UI log text, and README updates.
+- 2026-04-26: Added tests for rollout `session_meta` sync and snapshot rollout restore.
+- 2026-04-26: Verification passed: `py -3 -m unittest discover -s tests -v` (6 tests), `py -3 -m py_compile .\sync_backend.py .\tests\test_sync_backend.py`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -SmokeTest`.
+- 2026-04-26: Security sanity check found no high-confidence issue; restore validates snapshot sources stay inside the backup directory and rollout restore targets stay inside the selected Codex home.
+- 2026-04-26: SKILLS_TRACE using-superpowers -> brainstorming -> backend-delivery -> planning-with-files -> cc-skill-coding-standards -> cc-skill-backend-patterns; optimized rollout metadata reads for refresh/sync performance.
+- 2026-04-26: Measured real `status` before/after optimization: about 8146ms -> about 232ms. Verification passed: `py -3 -m unittest discover -s tests -v` (6 tests), `py -3 -m py_compile .\sync_backend.py .\tests\test_sync_backend.py`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -SmokeTest`.
+- 2026-04-26: SKILLS_TRACE using-superpowers -> brainstorming (approved previous design) -> backend-delivery -> frontend-delivery -> frontend-design -> planning-with-files -> cc-skill-coding-standards -> cc-skill-backend-patterns; implementing selective latest-20 recovery and preventing accidental full sync from the UI.
+- 2026-04-26: Implemented `list-candidates`, selected `sync --thread-id`, `sync --latest`, default latest-20 UI selection, and rollout `turn_context` model rewriting.
+- 2026-04-26: Verification passed: `py -3 -m unittest discover -s tests -v` (10 tests), `py -3 -m py_compile .\sync_backend.py .\tests\test_sync_backend.py`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -SmokeTest`.
+- 2026-04-26: Applied real selective recovery for the newest 20 old Linghu sessions. Latest stable status after delayed recheck: `model_movable_threads=216`, `gpt-5.5=61`, `rollout_db_mismatch_threads=0`; latest safety snapshot `C:\Users\lifeiyu\.codex\history_sync_backups\snapshot.pre-sync.20260426-234612`.
+- 2026-04-26: Security review sanity check: no high-confidence vulnerability identified; selected thread IDs are passed through parameterized SQLite placeholders, and restore/snapshot path containment checks remain in place.
+- 2026-04-27: SKILLS_TRACE using-superpowers -> brainstorming (approved lightweight design) -> backend-delivery -> planning-with-files -> frontend-delivery -> cc-skill-coding-standards -> cc-skill-backend-patterns; increasing candidate list limit to 1000 and making newest-first ordering explicit.
+- 2026-04-27: SKILL_DEGRADED repeatable-task-bootstrap/backend-delivery ops hook unavailable because `scripts/ops.ps1` is not present in this repository; fallback is direct commands plus progress/test evidence.
+- 2026-04-27: Implemented 1000-candidate loading in backend/UI, explicit newest-first UI summary, wider select-all button text, README update, and regression test for default limit/sort order. Verification passed: `py -3 -m unittest discover -s tests -v` (11 tests), `py -3 -m py_compile .\sync_backend.py .\tests\test_sync_backend.py`, `powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -SmokeTest`.

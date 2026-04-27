@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.bak
+*.lnk
+Thumbs.db
+.DS_Store
+
+# Local Codex data and generated backups should never be committed.
+.codex/
+history_sync_backups/
