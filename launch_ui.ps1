@@ -203,7 +203,11 @@ function Sync-CandidateChecksFromView {
 }
 
 function Render-Candidates {
-  Sync-CandidateChecksFromView
+  param([bool]$SyncFromView = $true)
+
+  if ($SyncFromView) {
+    Sync-CandidateChecksFromView
+  }
   $candidateList.BeginUpdate()
   try {
     $candidateList.Items.Clear()
@@ -273,7 +277,7 @@ function Refresh-Candidates {
     $script:CandidateCheckedIds[[string]$id] = $true
   }
 
-  Render-Candidates
+  Render-Candidates $false
 }
 
 function Select-DefaultCandidates {
@@ -285,7 +289,7 @@ function Select-DefaultCandidates {
   foreach ($id in @($script:LatestCandidates.default_selected_thread_ids)) {
     $script:CandidateCheckedIds[[string]$id] = $true
   }
-  Render-Candidates
+  Render-Candidates $false
 }
 
 function Set-AllCandidatesChecked {
