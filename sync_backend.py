@@ -14,8 +14,10 @@ from datetime import datetime
 from pathlib import Path
 
 SNAPSHOT_VERSION = 1
+TRASH_VERSION = 1
 DEFAULT_SELECTED_CANDIDATES = 20
 DEFAULT_CANDIDATE_LIST_LIMIT = 1000
+PROVIDERLESS_DISPLAY = "官方账号 / 无 provider"
 
 
 def default_codex_home() -> Path:
@@ -26,10 +28,42 @@ def default_codex_home() -> Path:
 class Paths:
     codex_home: Path
     config_path: Path
+    auth_path: Path
     db_path: Path
     backup_dir: Path
+    trash_dir: Path
     sessions_dir: Path
     archived_sessions_dir: Path
+
+
+@dataclass(frozen=True)
+class TargetProviderProfile:
+    kind: str
+    config_provider: str | None
+    display: str
+    db_value: str | None
+    rollout_policy: str
+    source: str
+
+    def matches(self, value: object) -> bool:
+        if self.kind == "official_providerless":
+            return is_providerless_value(value)
+        return value == self.config_provider
+
+    def mismatch_condition(self) -> tuple[str, list[object]]:
+        if self.kind == "official_providerless":
+            return "model_provider IS NOT NULL AND model_provider <> ''", []
+        return "model_provider IS NULL OR model_provider = '' OR model_provider <> ?", [self.config_provider]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "config_provider": self.config_provider,
+            "display": self.display,
+            "db_value": self.db_value,
+            "rollout_policy": self.rollout_policy,
+            "source": self.source,
+        }
 
 
 def resolve_paths(codex_home: str | None) -> Paths:
@@ -37,8 +71,10 @@ def resolve_paths(codex_home: str | None) -> Paths:
     return Paths(
         codex_home=home,
         config_path=home / "config.toml",
+        auth_path=home / "auth.json",
         db_path=home / "state_5.sqlite",
         backup_dir=home / "history_sync_backups",
+        trash_dir=home / "history_sync_trash",
         sessions_dir=home / "sessions",
         archived_sessions_dir=home / "archived_sessions",
     )
@@ -48,16 +84,76 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def parse_current_provider(config_text: str) -> str:
+def parse_current_provider(config_text: str) -> str | None:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
     if not match:
-        raise RuntimeError("Could not find model_provider in config.toml.")
+        return None
     return match.group(1)
 
 
 def parse_current_model(config_text: str) -> str | None:
     match = re.search(r'(?m)^\s*model\s*=\s*"([^"]+)"', config_text)
     return match.group(1) if match else None
+
+
+def provider_display(provider: str | None) -> str:
+    return provider if provider else PROVIDERLESS_DISPLAY
+
+
+def is_providerless_value(provider: object) -> bool:
+    return provider is None or provider == ""
+
+
+def provider_matches(value: object, current_provider: str | None) -> bool:
+    if is_providerless_value(current_provider):
+        return is_providerless_value(value)
+    return value == current_provider
+
+
+def provider_mismatch_condition(current_provider: str | None) -> tuple[str, list[str]]:
+    if is_providerless_value(current_provider):
+        return "model_provider IS NOT NULL AND model_provider <> ''", []
+    return "model_provider IS NULL OR model_provider = '' OR model_provider <> ?", [current_provider]
+
+
+def build_target_provider_profile(config_provider: str | None, provider_column_not_null: bool) -> TargetProviderProfile:
+    if not is_providerless_value(config_provider):
+        provider = str(config_provider)
+        return TargetProviderProfile(
+            kind="named_provider",
+            config_provider=provider,
+            display=provider,
+            db_value=provider,
+            rollout_policy="set_field",
+            source="config",
+        )
+    return TargetProviderProfile(
+        kind="official_providerless",
+        config_provider=None,
+        display=PROVIDERLESS_DISPLAY,
+        db_value="" if provider_column_not_null else None,
+        rollout_policy="omit_field",
+        source="schema_fallback",
+    )
+
+
+def file_modified_time_ms(path: Path) -> int | None:
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return None
+
+
+def current_account_started_at_ms(paths: Paths) -> int | None:
+    times = [
+        value
+        for value in (
+            file_modified_time_ms(paths.config_path),
+            file_modified_time_ms(paths.auth_path),
+        )
+        if value is not None
+    ]
+    return max(times) if times else None
 
 
 @contextmanager
@@ -75,6 +171,13 @@ def connect_db(path: Path, readonly: bool = False) -> Iterator[sqlite3.Connectio
 
 def get_thread_columns(conn: sqlite3.Connection) -> set[str]:
     return {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
+
+
+def is_thread_column_not_null(conn: sqlite3.Connection, column: str) -> bool:
+    for row in conn.execute("PRAGMA table_info(threads)"):
+        if str(row[1]) == column:
+            return bool(row[3])
+    return False
 
 
 def ensure_environment(paths: Paths) -> None:
@@ -168,28 +271,70 @@ def query_thread_metadata(conn: sqlite3.Connection) -> dict[str, dict[str, str |
 def query_sync_candidate_thread_ids(
     conn: sqlite3.Connection,
     *,
-    current_provider: str,
+    target_profile: TargetProviderProfile,
     current_model: str | None,
     columns: set[str],
+    current_account_started_ms: int | None = None,
     thread_ids: Iterable[str] | None = None,
 ) -> set[str]:
-    where_sql, params = build_sync_candidate_condition(current_provider, current_model, columns)
+    where_sql, params = build_sync_candidate_condition(
+        target_profile,
+        current_model,
+        columns,
+        current_account_started_ms,
+    )
+    where_sql, params = add_thread_id_filter(where_sql, params, thread_ids)
+    return {str(row[0]) for row in conn.execute(f"SELECT id FROM threads WHERE {where_sql}", params)}
+
+
+def query_account_guard_allowed_thread_ids(
+    conn: sqlite3.Connection,
+    *,
+    columns: set[str],
+    current_account_started_ms: int | None,
+    thread_ids: Iterable[str],
+) -> set[str]:
+    where_sql = "1 = 1"
+    params: list[object] = []
+    if current_account_started_ms is not None:
+        where_sql = f"({where_sql}) AND ({thread_activity_sql(columns)} < ?)"
+        params.append(current_account_started_ms)
     where_sql, params = add_thread_id_filter(where_sql, params, thread_ids)
     return {str(row[0]) for row in conn.execute(f"SELECT id FROM threads WHERE {where_sql}", params)}
 
 
 def build_sync_candidate_condition(
-    current_provider: str,
+    target_profile: TargetProviderProfile,
     current_model: str | None,
     columns: set[str],
-) -> tuple[str, list[str]]:
-    where_parts = ["model_provider IS NULL OR model_provider <> ?"]
-    params: list[str] = [current_provider]
+    current_account_started_ms: int | None = None,
+) -> tuple[str, list[object]]:
+    provider_where_sql, params = target_profile.mismatch_condition()
+    where_parts = [provider_where_sql]
     if "model" in columns and current_model:
         where_parts.append("model IS NULL OR model <> ?")
         params.append(current_model)
     where_sql = " OR ".join(f"({part})" for part in where_parts)
+    if current_account_started_ms is not None:
+        where_sql = f"({where_sql}) AND ({thread_activity_sql(columns)} < ?)"
+        params.append(current_account_started_ms)
     return where_sql, params
+
+
+def thread_activity_sql(columns: set[str]) -> str:
+    expressions = []
+    if "updated_at_ms" in columns:
+        expressions.append("updated_at_ms")
+    if "updated_at" in columns:
+        expressions.append("updated_at * 1000")
+    if "created_at_ms" in columns:
+        expressions.append("created_at_ms")
+    if "created_at" in columns:
+        expressions.append("created_at * 1000")
+    expressions.append("0")
+    if len(expressions) == 1:
+        return expressions[0]
+    return f"COALESCE({', '.join(expressions)})"
 
 
 def normalized_thread_ids(thread_ids: Iterable[str] | None) -> list[str]:
@@ -208,14 +353,21 @@ def normalized_thread_ids(thread_ids: Iterable[str] | None) -> list[str]:
 
 def add_thread_id_filter(
     where_sql: str,
-    params: list[str],
+    params: list[object],
     thread_ids: Iterable[str] | None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[object]]:
     selected_ids = normalized_thread_ids(thread_ids)
     if not selected_ids:
         return where_sql, params
     placeholders = ", ".join("?" for _ in selected_ids)
     return f"({where_sql}) AND id IN ({placeholders})", [*params, *selected_ids]
+
+
+def thread_id_filter_sql(thread_ids: list[str]) -> tuple[str, list[str]]:
+    if not thread_ids:
+        return "0 = 1", []
+    placeholders = ", ".join("?" for _ in thread_ids)
+    return f"id IN ({placeholders})", thread_ids
 
 
 def resolve_rollout_path(paths: Paths, rollout_path: str | None) -> Path | None:
@@ -259,8 +411,16 @@ def apply_thread_activity_time(paths: Paths, row: dict[str, object]) -> dict[str
     return row
 
 
-def is_sync_candidate_row(row: dict[str, object], current_provider: str, current_model: str | None, columns: set[str]) -> bool:
-    if row.get("model_provider") != current_provider:
+def is_sync_candidate_row(
+    row: dict[str, object],
+    target_profile: TargetProviderProfile,
+    current_model: str | None,
+    columns: set[str],
+    current_account_started_ms: int | None = None,
+) -> bool:
+    if current_account_started_ms is not None and thread_activity_time_ms(row) >= current_account_started_ms:
+        return False
+    if not target_profile.matches(row.get("model_provider")):
         return True
     if "model" in columns and current_model and row.get("model") != current_model:
         return True
@@ -275,15 +435,21 @@ def query_sync_candidates(
     conn: sqlite3.Connection,
     *,
     paths: Paths,
-    current_provider: str,
+    target_profile: TargetProviderProfile,
     current_model: str | None,
     columns: set[str],
+    current_account_started_ms: int | None = None,
     limit: int | None = DEFAULT_CANDIDATE_LIST_LIMIT,
     include_current: bool = False,
 ) -> list[dict[str, object]]:
     if limit is not None and limit <= 0:
         return []
-    candidate_where_sql, params = build_sync_candidate_condition(current_provider, current_model, columns)
+    candidate_where_sql, params = build_sync_candidate_condition(
+        target_profile,
+        current_model,
+        columns,
+        current_account_started_ms,
+    )
     where_sql = "1 = 1" if include_current else candidate_where_sql
     select_parts = [
         "id",
@@ -319,7 +485,13 @@ def query_sync_candidates(
             "updated_at_ms": int(row[8]) if row[8] is not None else None,
             "rollout_path": str(row[9]) if row[9] is not None else None,
         }
-        can_sync = is_sync_candidate_row(thread_row, current_provider, current_model, columns)
+        can_sync = is_sync_candidate_row(
+            thread_row,
+            target_profile,
+            current_model,
+            columns,
+            current_account_started_ms,
+        )
         thread_row["can_sync"] = can_sync
         thread_row["status"] = "可同步" if can_sync else "当前"
         rows.append(
@@ -341,8 +513,8 @@ def query_sync_candidates(
     return rows
 
 
-def should_update_rollout_meta(meta: RolloutMeta, current_provider: str, current_model: str | None) -> bool:
-    if meta.model_provider != current_provider:
+def should_update_rollout_meta(meta: RolloutMeta, target_profile: TargetProviderProfile, current_model: str | None) -> bool:
+    if not target_profile.matches(meta.model_provider):
         return True
     if current_model and meta.model != current_model:
         return True
@@ -362,13 +534,13 @@ def collect_rollout_updates(
     paths: Paths,
     *,
     thread_ids: set[str],
-    current_provider: str,
+    target_profile: TargetProviderProfile,
     current_model: str | None,
 ) -> list[RolloutMeta]:
     updates = []
     for meta in collect_rollout_metas(paths):
         if meta.thread_id in thread_ids and (
-            should_update_rollout_meta(meta, current_provider, current_model)
+            should_update_rollout_meta(meta, target_profile, current_model)
             or rollout_has_outdated_turn_context(meta.path, current_model)
         ):
             updates.append(meta)
@@ -413,7 +585,7 @@ def newline_for_line(line: str) -> str:
     return ""
 
 
-def rewrite_rollout_meta(path: Path, current_provider: str, current_model: str | None) -> bool:
+def rewrite_rollout_meta(path: Path, target_profile: TargetProviderProfile, current_model: str | None) -> bool:
     text = read_jsonl_text(path)
     lines = text.splitlines(keepends=True)
     changed = False
@@ -425,7 +597,7 @@ def rewrite_rollout_meta(path: Path, current_provider: str, current_model: str |
             record = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if update_rollout_record(record, current_provider, current_model):
+        if update_rollout_record(record, target_profile, current_model):
             lines[index] = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + newline_for_line(line)
             changed = True
     if not changed:
@@ -434,10 +606,10 @@ def rewrite_rollout_meta(path: Path, current_provider: str, current_model: str |
     return True
 
 
-def update_rollout_record(record: object, current_provider: str, current_model: str | None) -> bool:
+def update_rollout_record(record: object, target_profile: TargetProviderProfile, current_model: str | None) -> bool:
     payload = extract_payload(record)
     if payload is not None:
-        return update_session_meta_payload(payload, current_provider, current_model)
+        return update_session_meta_payload(payload, target_profile, current_model)
     if not isinstance(record, dict) or record.get("type") != "turn_context":
         return False
     turn_payload = record.get("payload")
@@ -448,12 +620,16 @@ def update_rollout_record(record: object, current_provider: str, current_model: 
 
 def update_session_meta_payload(
     payload: dict[str, object],
-    current_provider: str,
+    target_profile: TargetProviderProfile,
     current_model: str | None,
 ) -> bool:
     changed = False
-    if payload.get("model_provider") != current_provider:
-        payload["model_provider"] = current_provider
+    if target_profile.rollout_policy == "omit_field":
+        if "model_provider" in payload:
+            del payload["model_provider"]
+            changed = True
+    elif payload.get("model_provider") != target_profile.config_provider:
+        payload["model_provider"] = target_profile.config_provider
         changed = True
     if current_model and payload.get("model") != current_model:
         payload["model"] = current_model
@@ -553,14 +729,33 @@ def count_mismatched(conn: sqlite3.Connection, column: str, expected: str | None
     )
 
 
+def count_provider_mismatched(
+    conn: sqlite3.Connection,
+    target_profile: TargetProviderProfile,
+    columns: set[str],
+    current_account_started_ms: int | None = None,
+) -> int:
+    where_sql, params = target_profile.mismatch_condition()
+    if current_account_started_ms is not None:
+        where_sql = f"({where_sql}) AND ({thread_activity_sql(columns)} < ?)"
+        params.append(current_account_started_ms)
+    return int(conn.execute(f"SELECT COUNT(*) FROM threads WHERE {where_sql}", params).fetchone()[0])
+
+
 def count_sync_candidates(
     conn: sqlite3.Connection,
     *,
-    current_provider: str,
+    target_profile: TargetProviderProfile,
     current_model: str | None,
     columns: set[str],
+    current_account_started_ms: int | None = None,
 ) -> int:
-    where_sql, params = build_sync_candidate_condition(current_provider, current_model, columns)
+    where_sql, params = build_sync_candidate_condition(
+        target_profile,
+        current_model,
+        columns,
+        current_account_started_ms,
+    )
     return int(conn.execute(f"SELECT COUNT(*) FROM threads WHERE {where_sql}", params).fetchone()[0])
 
 
@@ -577,22 +772,29 @@ def get_sync_candidates(
     config_text = read_text(paths.config_path)
     current_provider = parse_current_provider(config_text)
     current_model = parse_current_model(config_text)
+    account_started_ms = current_account_started_at_ms(paths)
 
     with connect_db(paths.db_path, readonly=True) as conn:
         columns = get_thread_columns(conn)
+        target_profile = build_target_provider_profile(
+            current_provider,
+            is_thread_column_not_null(conn, "model_provider"),
+        )
         total_candidates = count_sync_candidates(
             conn,
-            current_provider=current_provider,
+            target_profile=target_profile,
             current_model=current_model,
             columns=columns,
+            current_account_started_ms=account_started_ms,
         )
         total_threads = count_threads(conn)
         candidates = query_sync_candidates(
             conn,
             paths=paths,
-            current_provider=current_provider,
+            target_profile=target_profile,
             current_model=current_model,
             columns=columns,
+            current_account_started_ms=account_started_ms,
             limit=limit,
             include_current=include_current,
         )
@@ -605,7 +807,10 @@ def get_sync_candidates(
     return {
         "action": "list-candidates",
         "current_provider": current_provider,
+        "current_provider_display": target_profile.display,
+        "target_provider_profile": target_profile.to_json(),
         "current_model": current_model,
+        "current_account_started_at_ms": account_started_ms,
         "include_current": include_current,
         "total_threads": total_threads,
         "total_candidates": total_candidates,
@@ -668,7 +873,7 @@ def build_rollout_status(paths: Paths, thread_rows: dict[str, dict[str, str | No
         thread = thread_rows.get(meta.thread_id)
         if not thread:
             continue
-        if thread.get("model_provider") != meta.model_provider:
+        if not provider_matches(thread.get("model_provider"), meta.model_provider):
             mismatch_count += 1
             continue
         db_model = thread.get("model")
@@ -695,22 +900,33 @@ def get_status(paths: Paths) -> dict[str, object]:
     config_text = read_text(paths.config_path)
     current_provider = parse_current_provider(config_text)
     current_model = parse_current_model(config_text)
+    account_started_ms = current_account_started_at_ms(paths)
 
     with connect_db(paths.db_path, readonly=True) as conn:
         columns = get_thread_columns(conn)
+        target_profile = build_target_provider_profile(
+            current_provider,
+            is_thread_column_not_null(conn, "model_provider"),
+        )
         counts = query_provider_counts(conn)
         model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
         provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
         cwd_counts = query_cwd_counts(conn) if "cwd" in columns else []
         thread_rows = query_thread_metadata(conn)
         total_threads = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
-        provider_movable = count_mismatched(conn, "model_provider", current_provider)
+        provider_movable = count_provider_mismatched(
+            conn,
+            target_profile,
+            columns,
+            current_account_started_ms=account_started_ms,
+        )
         model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
         moved_if_sync = count_sync_candidates(
             conn,
-            current_provider=current_provider,
+            target_profile=target_profile,
             current_model=current_model,
             columns=columns,
+            current_account_started_ms=account_started_ms,
         )
     rollout_status = build_rollout_status(paths, thread_rows)
 
@@ -719,10 +935,14 @@ def get_status(paths: Paths) -> dict[str, object]:
         "config_path": str(paths.config_path),
         "db_path": str(paths.db_path),
         "backup_dir": str(paths.backup_dir),
+        "trash_dir": str(paths.trash_dir),
         "sessions_dir": str(paths.sessions_dir),
         "archived_sessions_dir": str(paths.archived_sessions_dir),
         "current_provider": current_provider,
+        "current_provider_display": target_profile.display,
+        "target_provider_profile": target_profile.to_json(),
         "current_model": current_model,
+        "current_account_started_at_ms": account_started_ms,
         "total_threads": total_threads,
         "movable_threads": moved_if_sync,
         "provider_movable_threads": provider_movable,
@@ -820,29 +1040,47 @@ def checkpoint(conn: sqlite3.Connection) -> tuple[int, int, int]:
 
 def sync_to_current_provider(paths: Paths, thread_ids: Iterable[str] | None = None) -> dict[str, object]:
     status_before = get_status(paths)
-    current_provider = str(status_before["current_provider"])
+    status_provider = status_before.get("current_provider")
+    current_provider = str(status_provider) if status_provider is not None else None
     current_model = status_before.get("current_model")
     current_model = str(current_model) if current_model else None
+    account_started_ms = status_before.get("current_account_started_at_ms")
+    account_started_ms = int(account_started_ms) if account_started_ms is not None else None
     selected_ids = normalized_thread_ids(thread_ids)
 
     with connect_db(paths.db_path, readonly=True) as conn:
         columns = get_thread_columns(conn)
+        target_profile = build_target_provider_profile(
+            current_provider,
+            is_thread_column_not_null(conn, "model_provider"),
+        )
         if thread_ids is not None and not selected_ids:
             candidate_thread_ids: set[str] = set()
+            rollout_scope_thread_ids: set[str] = set()
         else:
             candidate_thread_ids = query_sync_candidate_thread_ids(
                 conn,
-                current_provider=current_provider,
+                target_profile=target_profile,
                 current_model=current_model,
                 columns=columns,
+                current_account_started_ms=account_started_ms,
                 thread_ids=selected_ids if thread_ids is not None else None,
             )
+            rollout_scope_thread_ids = (
+                query_account_guard_allowed_thread_ids(
+                    conn,
+                    columns=columns,
+                    current_account_started_ms=account_started_ms,
+                    thread_ids=selected_ids,
+                )
+                if thread_ids is not None
+                else candidate_thread_ids
+            )
 
-    rollout_scope_thread_ids = set(selected_ids) if thread_ids is not None else candidate_thread_ids
     rollout_updates = collect_rollout_updates(
         paths,
         thread_ids=rollout_scope_thread_ids,
-        current_provider=current_provider,
+        target_profile=target_profile,
         current_model=current_model,
     )
     backup_path = (
@@ -853,13 +1091,22 @@ def sync_to_current_provider(paths: Paths, thread_ids: Iterable[str] | None = No
 
     with connect_db(paths.db_path, readonly=False) as conn:
         columns = get_thread_columns(conn)
+        target_profile = build_target_provider_profile(
+            current_provider,
+            is_thread_column_not_null(conn, "model_provider"),
+        )
         before_counts = query_provider_counts(conn)
         before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
 
-        set_parts = ["model_provider = ?"]
-        set_params = [current_provider]
-        where_parts = ["model_provider IS NULL OR model_provider <> ?"]
-        where_params = [current_provider]
+        provider_db_value = target_profile.db_value
+        if provider_db_value is None:
+            set_parts = ["model_provider = NULL"]
+            set_params: list[str] = []
+        else:
+            set_parts = ["model_provider = ?"]
+            set_params = [provider_db_value]
+        provider_where_sql, where_params = target_profile.mismatch_condition()
+        where_parts = [provider_where_sql]
         synced_fields = ["model_provider"]
 
         if "model" in columns and current_model:
@@ -872,8 +1119,7 @@ def sync_to_current_provider(paths: Paths, thread_ids: Iterable[str] | None = No
         if candidate_thread_ids:
             set_sql = ", ".join(set_parts)
             where_sql = " OR ".join(f"({part})" for part in where_parts)
-            if thread_ids is not None:
-                where_sql, where_params = add_thread_id_filter(where_sql, where_params, sorted(candidate_thread_ids))
+            where_sql, where_params = add_thread_id_filter(where_sql, where_params, sorted(candidate_thread_ids))
             updated_rows = conn.execute(
                 f"UPDATE threads SET {set_sql} WHERE {where_sql}",
                 (*set_params, *where_params),
@@ -888,13 +1134,16 @@ def sync_to_current_provider(paths: Paths, thread_ids: Iterable[str] | None = No
 
     updated_rollout_files = 0
     for meta in rollout_updates:
-        if rewrite_rollout_meta(meta.path, current_provider, current_model):
+        if rewrite_rollout_meta(meta.path, target_profile, current_model):
             updated_rollout_files += 1
 
     return {
         "action": "sync",
         "current_provider": current_provider,
+        "current_provider_display": target_profile.display,
+        "target_provider_profile": target_profile.to_json(),
         "current_model": current_model,
+        "current_account_started_at_ms": account_started_ms,
         "synced_fields": synced_fields,
         "updated_rows": updated_rows,
         "updated_rollout_files": updated_rollout_files,
@@ -1028,6 +1277,288 @@ def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
     }
 
 
+def unique_trash_path(paths: Paths, label: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") or "sessions"
+    base_path = paths.trash_dir / f"trash.{safe_label}.{timestamp}"
+    if not base_path.exists():
+        return base_path
+    for index in range(1, 1000):
+        candidate = paths.trash_dir / f"trash.{safe_label}.{timestamp}.{index:03d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Could not allocate a unique trash path.")
+
+
+def query_thread_rows(conn: sqlite3.Connection, thread_ids: list[str]) -> tuple[list[str], list[dict[str, object]]]:
+    columns = [str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")]
+    if not columns:
+        raise RuntimeError("Could not read threads table columns.")
+    where_sql, params = thread_id_filter_sql(thread_ids)
+    rows = []
+    for row in conn.execute(f"SELECT {', '.join(columns)} FROM threads WHERE {where_sql}", params):
+        rows.append({column: row[index] for index, column in enumerate(columns)})
+    return columns, rows
+
+
+def resolve_thread_rollout_paths(paths: Paths, thread_rows: list[dict[str, object]]) -> dict[str, Path]:
+    output: dict[str, Path] = {}
+    selected_ids = {str(row["id"]) for row in thread_rows if row.get("id")}
+    for row in thread_rows:
+        thread_id = str(row.get("id") or "")
+        rollout_path = resolve_rollout_path(paths, row.get("rollout_path") if isinstance(row.get("rollout_path"), str) else None)
+        if thread_id and rollout_path and rollout_path.exists():
+            output[thread_id] = rollout_path
+    missing_ids = selected_ids - set(output)
+    if missing_ids:
+        for meta in collect_rollout_metas(paths):
+            if meta.thread_id in missing_ids and meta.path.exists():
+                output[meta.thread_id] = meta.path
+    return output
+
+
+def move_rollouts_to_trash(paths: Paths, trash_path: Path, rollout_paths: dict[str, Path]) -> list[dict[str, object]]:
+    rollout_dir = trash_path / "rollouts"
+    entries = []
+    for index, (thread_id, rollout_path) in enumerate(sorted(rollout_paths.items()), start=1):
+        try:
+            relative_path = relative_to_codex_home(paths, rollout_path)
+        except RuntimeError:
+            continue
+        if not rollout_path.exists():
+            continue
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        trash_name = safe_backup_name(index, rollout_path)
+        trash_file = rollout_dir / trash_name
+        shutil.move(str(rollout_path), str(trash_file))
+        entries.append(
+            {
+                "thread_id": thread_id,
+                "path": str(rollout_path),
+                "relative_path": relative_path,
+                "trash_path": str(Path("rollouts") / trash_name),
+            }
+        )
+    return entries
+
+
+def delete_thread_rows(conn: sqlite3.Connection, thread_ids: list[str]) -> int:
+    where_sql, params = thread_id_filter_sql(thread_ids)
+    return int(conn.execute(f"DELETE FROM threads WHERE {where_sql}", params).rowcount)
+
+
+def old_thread_ids(conn: sqlite3.Connection, columns: set[str], older_than_days: int | None) -> list[str]:
+    if older_than_days is None:
+        return []
+    if older_than_days <= 0:
+        raise RuntimeError("--older-than-days must be greater than 0.")
+    cutoff_ms = int(datetime.now().timestamp() * 1000) - (older_than_days * 24 * 60 * 60 * 1000)
+    activity_sql = thread_activity_sql(columns)
+    return [str(row[0]) for row in conn.execute(f"SELECT id FROM threads WHERE {activity_sql} < ?", (cutoff_ms,))]
+
+
+def trash_sessions(
+    paths: Paths,
+    thread_ids: Iterable[str] | None = None,
+    *,
+    older_than_days: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    ensure_environment(paths)
+    requested_ids = normalized_thread_ids(thread_ids)
+    with connect_db(paths.db_path, readonly=True) as conn:
+        columns_set = get_thread_columns(conn)
+        selected_ids = requested_ids or old_thread_ids(conn, columns_set, older_than_days)
+        columns, rows = query_thread_rows(conn, selected_ids)
+        existing_ids = [str(row["id"]) for row in rows]
+        rollout_paths = resolve_thread_rollout_paths(paths, rows)
+
+    if dry_run:
+        return {
+            "action": "trash-preview",
+            "requested_thread_ids": requested_ids if thread_ids is not None else None,
+            "selected_thread_ids": existing_ids,
+            "older_than_days": older_than_days,
+            "thread_count": len(rows),
+            "rollout_file_count": len(rollout_paths),
+            "trash_path": None,
+        }
+
+    if not rows:
+        return {
+            "action": "trash",
+            "requested_thread_ids": requested_ids if thread_ids is not None else None,
+            "selected_thread_ids": [],
+            "older_than_days": older_than_days,
+            "deleted_rows": 0,
+            "moved_rollout_files": 0,
+            "trash_path": None,
+        }
+
+    paths.trash_dir.mkdir(parents=True, exist_ok=True)
+    trash_path = unique_trash_path(paths, "sessions")
+    trash_path.mkdir()
+    restore_snapshot = make_backup(paths, "pre-trash", rollout_paths.values())
+    rollout_entries = move_rollouts_to_trash(paths, trash_path, rollout_paths)
+    manifest = {
+        "version": TRASH_VERSION,
+        "label": "sessions",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "codex_home": str(paths.codex_home),
+        "safety_backup": str(restore_snapshot),
+        "thread_columns": columns,
+        "threads": rows,
+        "rollout_files": rollout_entries,
+    }
+    (trash_path / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    with connect_db(paths.db_path, readonly=False) as conn:
+        deleted_rows = delete_thread_rows(conn, existing_ids)
+        conn.commit()
+        checkpoint_result = checkpoint(conn)
+
+    return {
+        "action": "trash",
+        "requested_thread_ids": requested_ids if thread_ids is not None else None,
+        "selected_thread_ids": existing_ids,
+        "older_than_days": older_than_days,
+        "deleted_rows": deleted_rows,
+        "moved_rollout_files": len(rollout_entries),
+        "trash_path": str(trash_path),
+        "safety_backup": str(restore_snapshot),
+        "checkpoint": {
+            "busy": checkpoint_result[0],
+            "log_frames": checkpoint_result[1],
+            "checkpointed_frames": checkpoint_result[2],
+        },
+    }
+
+
+def is_trash_item(path: Path) -> bool:
+    return path.is_dir() and path.name.startswith("trash.") and (path / "manifest.json").exists()
+
+
+def list_trash(paths: Paths, limit: int = 20) -> list[dict[str, object]]:
+    if not paths.trash_dir.exists():
+        return []
+    items = sorted(
+        [item for item in paths.trash_dir.iterdir() if is_trash_item(item)],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    output = []
+    for item in items[:limit]:
+        manifest = read_trash_manifest(item)
+        threads = manifest.get("threads") if isinstance(manifest.get("threads"), list) else []
+        rollouts = manifest.get("rollout_files") if isinstance(manifest.get("rollout_files"), list) else []
+        output.append(
+            {
+                "name": item.name,
+                "path": str(item),
+                "created_at": manifest.get("created_at"),
+                "modified_at": datetime.fromtimestamp(item.stat().st_mtime).isoformat(timespec="seconds"),
+                "thread_count": len(threads),
+                "rollout_file_count": len(rollouts),
+            }
+        )
+    return output
+
+
+def resolve_trash(paths: Paths, requested_path: str | None) -> Path:
+    if requested_path:
+        trash_path = Path(requested_path).expanduser()
+    else:
+        items = list_trash(paths, limit=1)
+        if not items:
+            raise RuntimeError("No trash snapshots were found.")
+        trash_path = Path(str(items[0]["path"]))
+    if not is_trash_item(trash_path):
+        raise RuntimeError(f"Invalid trash snapshot: {trash_path}")
+    return trash_path
+
+
+def read_trash_manifest(trash_path: Path) -> dict[str, object]:
+    manifest_path = trash_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("version") != TRASH_VERSION:
+        raise RuntimeError(f"Invalid trash manifest: {manifest_path}")
+    return manifest
+
+
+def restore_trash_rollouts(paths: Paths, trash_path: Path, manifest: dict[str, object]) -> tuple[int, int]:
+    rollout_files = manifest.get("rollout_files")
+    if not isinstance(rollout_files, list):
+        return 0, 0
+    restored = 0
+    conflicts = 0
+    for entry in rollout_files:
+        if not isinstance(entry, dict):
+            continue
+        trash_relative = entry.get("trash_path")
+        target_relative = entry.get("relative_path")
+        if not isinstance(trash_relative, str) or not isinstance(target_relative, str):
+            continue
+        source = resolve_snapshot_file(trash_path, trash_relative)
+        target = paths.codex_home / target_relative
+        try:
+            target.resolve().relative_to(paths.codex_home.resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"Refusing to restore rollout outside Codex home: {target}") from exc
+        if target.exists():
+            conflicts += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+        restored += 1
+    return restored, conflicts
+
+
+def restore_trash(paths: Paths, trash_path: str | None = None) -> dict[str, object]:
+    ensure_environment(paths)
+    chosen_trash = resolve_trash(paths, trash_path)
+    manifest = read_trash_manifest(chosen_trash)
+    threads = manifest.get("threads")
+    columns = manifest.get("thread_columns")
+    if not isinstance(threads, list) or not isinstance(columns, list) or not all(isinstance(column, str) for column in columns):
+        raise RuntimeError("Invalid trash manifest thread data.")
+    restore_snapshot = make_backup(paths, "pre-trash-restore")
+
+    restored_rows = 0
+    if threads:
+        placeholders = ", ".join("?" for _ in columns)
+        column_sql = ", ".join(columns)
+        with connect_db(paths.db_path, readonly=False) as conn:
+            for row in threads:
+                if not isinstance(row, dict):
+                    continue
+                values = [row.get(column) for column in columns]
+                restored_rows += int(
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO threads ({column_sql}) VALUES ({placeholders})",
+                        values,
+                    ).rowcount
+                )
+            conn.commit()
+            checkpoint_result = checkpoint(conn)
+    else:
+        checkpoint_result = (0, 0, 0)
+
+    restored_rollouts, rollout_conflicts = restore_trash_rollouts(paths, chosen_trash, manifest)
+    return {
+        "action": "restore-trash",
+        "restored_from": str(chosen_trash),
+        "safety_backup": str(restore_snapshot),
+        "restored_rows": restored_rows,
+        "restored_rollout_files": restored_rollouts,
+        "rollout_conflicts": rollout_conflicts,
+        "checkpoint": {
+            "busy": checkpoint_result[0],
+            "log_frames": checkpoint_result[1],
+            "checkpointed_frames": checkpoint_result[2],
+        },
+    }
+
+
 def to_json(payload: dict[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=True, indent=2)
 
@@ -1048,6 +1579,14 @@ def main() -> int:
     restore_parser = subparsers.add_parser("restore", help="Restore from a backup")
     restore_parser.add_argument("--backup", help="Backup file path; newest backup is used when omitted")
     subparsers.add_parser("backup", help="Create a manual backup")
+    trash_parser = subparsers.add_parser("trash", help="Move selected or old threads into recoverable trash")
+    trash_parser.add_argument("--thread-id", action="append", help="Thread id to trash; repeat for multiple threads")
+    trash_parser.add_argument("--older-than-days", type=int, help="Trash threads older than N days")
+    trash_parser.add_argument("--dry-run", action="store_true", help="Preview trash selection without changing files")
+    trash_list_parser = subparsers.add_parser("list-trash", help="List recoverable trash snapshots")
+    trash_list_parser.add_argument("--limit", type=int, default=20)
+    restore_trash_parser = subparsers.add_parser("restore-trash", help="Restore from a trash snapshot")
+    restore_trash_parser.add_argument("--trash", help="Trash snapshot path; newest trash is used when omitted")
 
     args = parser.parse_args()
     paths = resolve_paths(args.codex_home)
@@ -1069,6 +1608,18 @@ def main() -> int:
         elif args.command == "backup":
             ensure_environment(paths)
             payload = {"action": "backup", "backup_path": str(make_backup(paths, "manual", full_rollout=True))}
+        elif args.command == "trash":
+            payload = trash_sessions(
+                paths,
+                args.thread_id,
+                older_than_days=args.older_than_days,
+                dry_run=args.dry_run,
+            )
+        elif args.command == "list-trash":
+            ensure_environment(paths)
+            payload = {"action": "list-trash", "trash": list_trash(paths, limit=args.limit)}
+        elif args.command == "restore-trash":
+            payload = restore_trash(paths, args.trash)
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except Exception as exc:

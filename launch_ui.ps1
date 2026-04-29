@@ -193,8 +193,7 @@ function Sync-CandidateChecksFromView {
     if (-not $threadId) {
       continue
     }
-    $row = $script:CandidateMap[$threadId]
-    if ($item.Checked -and $row -and $row.can_sync) {
+    if ($item.Checked) {
       $script:CandidateCheckedIds[$threadId] = $true
     } else {
       $script:CandidateCheckedIds.Remove($threadId)
@@ -229,7 +228,7 @@ function Render-Candidates {
 
       $item = New-Object System.Windows.Forms.ListViewItem('')
       $item.Tag = $threadId
-      $item.Checked = $row.can_sync -and $script:CandidateCheckedIds.ContainsKey($threadId)
+      $item.Checked = $script:CandidateCheckedIds.ContainsKey($threadId)
       if (-not $row.can_sync) {
         $item.BackColor = $script:ColorCurrentRow
         $item.ForeColor = $script:ColorDisabledText
@@ -255,15 +254,22 @@ function Render-Candidates {
 
 function Update-CandidateSummary {
   $selectedCount = $script:CandidateCheckedIds.Count
+  $syncSelectedCount = 0
+  foreach ($threadId in $script:CandidateCheckedIds.Keys) {
+    $row = $script:CandidateMap[$threadId]
+    if ($row -and $row.can_sync) {
+      $syncSelectedCount++
+    }
+  }
   $visibleCount = if ($candidateList) { $candidateList.Items.Count } else { 0 }
   $totalCount = if ($script:LatestCandidates) { $script:LatestCandidates.total_candidates } else { 0 }
   $currentCount = if ($script:LatestCandidates) { $script:LatestCandidates.current_count } else { 0 }
   $threadCount = if ($script:LatestCandidates) { $script:LatestCandidates.total_threads } else { $totalCount }
   $limit = if ($script:LatestCandidates) { $script:LatestCandidates.limit } else { $script:CandidateListLimit }
-  $candidateSummaryLabel.Text = "全部: $threadCount    可同步: $totalCount    当前: $currentCount    显示: $visibleCount/$limit    已选: $selectedCount"
+  $candidateSummaryLabel.Text = "全部: $threadCount    可同步: $totalCount    当前: $currentCount    显示: $visibleCount/$limit    勾选: $selectedCount    可同步勾选: $syncSelectedCount"
   if ($candidateCountValueLabel) {
     $candidateCountValueLabel.Text = "$threadCount / $totalCount"
-    $candidateCountDetailLabel.Text = "全部 / 可同步，已选 $selectedCount"
+    $candidateCountDetailLabel.Text = "全部 / 可同步，勾选 $selectedCount"
   }
 }
 
@@ -272,10 +278,6 @@ function Refresh-Candidates {
   $script:LatestCandidates = $candidates
   $script:CandidateRows = @($candidates.candidates)
   $script:CandidateCheckedIds = @{}
-
-  foreach ($id in @($candidates.default_selected_thread_ids)) {
-    $script:CandidateCheckedIds[[string]$id] = $true
-  }
 
   Render-Candidates $false
 }
@@ -301,9 +303,8 @@ function Set-AllCandidatesChecked {
 
   foreach ($item in $candidateList.Items) {
     $threadId = [string]$item.Tag
-    $row = $script:CandidateMap[$threadId]
     if ($Checked) {
-      if ($row -and $row.can_sync) {
+      if ($threadId) {
         $script:CandidateCheckedIds[$threadId] = $true
         $item.Checked = $true
       }
@@ -319,16 +320,41 @@ function Get-SelectedCandidateIds {
   Sync-CandidateChecksFromView
   $ids = New-Object System.Collections.Generic.List[string]
   foreach ($threadId in $script:CandidateCheckedIds.Keys) {
+    $row = $script:CandidateMap[$threadId]
+    if ($row -and $row.can_sync) {
+      [void]$ids.Add([string]$threadId)
+    }
+  }
+  return ,$ids.ToArray()
+}
+
+function Get-CheckedCandidateIds {
+  Sync-CandidateChecksFromView
+  $ids = New-Object System.Collections.Generic.List[string]
+  foreach ($threadId in $script:CandidateCheckedIds.Keys) {
     [void]$ids.Add([string]$threadId)
   }
-  return $ids.ToArray()
+  return ,$ids.ToArray()
+}
+
+function Get-SelectedRowIds {
+  $ids = New-Object System.Collections.Generic.List[string]
+  foreach ($item in $candidateList.SelectedItems) {
+    $threadId = [string]$item.Tag
+    if ($threadId) {
+      [void]$ids.Add($threadId)
+    }
+  }
+  return ,$ids.ToArray()
 }
 
 function Refresh-State {
   $status = Invoke-Backend @('--json', 'status')
   $script:LatestState = $status
 
-  $providerValueLabel.Text = [string]$status.current_provider
+  $currentProviderDisplay = if ($status.current_provider_display) { [string]$status.current_provider_display } else { [string]$status.current_provider }
+  $providerValueLabel.Text = $currentProviderDisplay
+  $profileKind = if ($status.target_provider_profile) { [string]$status.target_provider_profile.kind } else { 'legacy' }
   $providerDetailLabel.Text = "需同步 provider: $($status.provider_movable_threads)"
   $modelValueLabel.Text = if ($status.current_model) { [string]$status.current_model } else { '未读取到' }
   $modelDetailLabel.Text = "需同步模型: $($status.model_movable_threads)"
@@ -340,7 +366,8 @@ function Refresh-State {
 
   $providersView.Items.Clear()
   foreach ($row in $status.provider_counts) {
-    $isCurrent = if ($row.provider -eq $status.current_provider) { '是' } else { '' }
+    $isProviderlessCurrent = (-not $status.current_provider) -and ($row.provider -eq '(empty)')
+    $isCurrent = if (($row.provider -eq $status.current_provider) -or $isProviderlessCurrent) { '是' } else { '' }
     $item = New-Object System.Windows.Forms.ListViewItem([string]$row.provider)
     [void]$item.SubItems.Add([string]$row.count)
     [void]$item.SubItems.Add($isCurrent)
@@ -356,7 +383,7 @@ function Refresh-State {
   }
 
   Refresh-Candidates
-  Append-Log "状态已刷新。当前 provider=$($status.current_provider)，当前模型=$($status.current_model)，可同步线程=$($status.movable_threads)，DB/Rollout不一致=$($status.rollout_db_mismatch_threads)。"
+  Append-Log "状态已刷新。当前 provider=$currentProviderDisplay，目标形态=$profileKind，当前模型=$($status.current_model)，可同步线程=$($status.movable_threads)，DB/Rollout不一致=$($status.rollout_db_mismatch_threads)。"
 }
 
 function Confirm-Action {
@@ -463,12 +490,13 @@ function Apply-ResponsiveLayout {
   $candidateList.Columns[6].Width = 76
   $candidateList.Columns[7].Width = 120
 
+  $backupPanelHeight = 324
   $backupsBox.Location = New-Object System.Drawing.Point($rightX, $mainTop)
-  $backupsBox.Size = New-Object System.Drawing.Size($rightPanelWidth, 250)
-  $backupList.Size = New-Object System.Drawing.Size(($rightPanelWidth - 24), 116)
+  $backupsBox.Size = New-Object System.Drawing.Size($rightPanelWidth, $backupPanelHeight)
+  $backupList.Size = New-Object System.Drawing.Size(($rightPanelWidth - 24), 112)
 
   $providersBox.Location = New-Object System.Drawing.Point($rightX, ($backupsBox.Bottom + $gap))
-  $providersBox.Size = New-Object System.Drawing.Size($rightPanelWidth, [Math]::Max(150, $mainHeight - $backupsBox.Height - $gap))
+  $providersBox.Size = New-Object System.Drawing.Size($rightPanelWidth, [Math]::Max(132, $mainHeight - $backupsBox.Height - $gap))
   $providersView.Size = New-Object System.Drawing.Size(($rightPanelWidth - 24), [Math]::Max(92, $providersBox.ClientSize.Height - 38))
   $providersView.Columns[0].Width = 220
   $providersView.Columns[1].Width = 90
@@ -598,10 +626,19 @@ $clearSelectionButton.Location = New-Object System.Drawing.Point(254, 54)
 $clearSelectionButton.BackColor = $script:ColorSurface
 $candidateBox.Controls.Add($clearSelectionButton)
 
+$trashSelectedRowsButton = New-Object System.Windows.Forms.Button
+$trashSelectedRowsButton.Text = '删除选中行'
+$trashSelectedRowsButton.Size = New-Object System.Drawing.Size(104, 30)
+$trashSelectedRowsButton.Location = New-Object System.Drawing.Point(356, 54)
+$trashSelectedRowsButton.ForeColor = $script:ColorDanger
+$trashSelectedRowsButton.BackColor = $script:ColorSurface
+$candidateBox.Controls.Add($trashSelectedRowsButton)
+
 $candidateList = New-Object System.Windows.Forms.ListView
 $candidateList.View = 'Details'
 $candidateList.CheckBoxes = $true
 $candidateList.FullRowSelect = $true
+$candidateList.MultiSelect = $true
 $candidateList.GridLines = $true
 $candidateList.HideSelection = $false
 $candidateList.ShowItemToolTips = $true
@@ -624,12 +661,12 @@ $backupsBox = New-Object System.Windows.Forms.GroupBox
 $backupsBox.Text = '备份与恢复'
 $backupsBox.ForeColor = $script:ColorText
 $backupsBox.Location = New-Object System.Drawing.Point(814, 246)
-$backupsBox.Size = New-Object System.Drawing.Size(326, 250)
+$backupsBox.Size = New-Object System.Drawing.Size(326, 324)
 $form.Controls.Add($backupsBox)
 
 $backupList = New-Object System.Windows.Forms.ListBox
 $backupList.Location = New-Object System.Drawing.Point(12, 24)
-$backupList.Size = New-Object System.Drawing.Size(302, 116)
+$backupList.Size = New-Object System.Drawing.Size(302, 112)
 $backupList.HorizontalScrollbar = $true
 $backupList.BackColor = $script:ColorSurface
 $backupList.ForeColor = $script:ColorText
@@ -638,28 +675,28 @@ $backupsBox.Controls.Add($backupList)
 $backupButton = New-Object System.Windows.Forms.Button
 $backupButton.Text = '手动备份'
 $backupButton.Size = New-Object System.Drawing.Size(94, 32)
-$backupButton.Location = New-Object System.Drawing.Point(12, 150)
+$backupButton.Location = New-Object System.Drawing.Point(12, 148)
 $backupButton.BackColor = $script:ColorSurface
 $backupsBox.Controls.Add($backupButton)
 
 $openBackupsButton = New-Object System.Windows.Forms.Button
 $openBackupsButton.Text = '打开目录'
 $openBackupsButton.Size = New-Object System.Drawing.Size(94, 32)
-$openBackupsButton.Location = New-Object System.Drawing.Point(114, 150)
+$openBackupsButton.Location = New-Object System.Drawing.Point(114, 148)
 $openBackupsButton.BackColor = $script:ColorSurface
 $backupsBox.Controls.Add($openBackupsButton)
 
 $shortcutButton = New-Object System.Windows.Forms.Button
 $shortcutButton.Text = '重建图标'
 $shortcutButton.Size = New-Object System.Drawing.Size(94, 32)
-$shortcutButton.Location = New-Object System.Drawing.Point(216, 150)
+$shortcutButton.Location = New-Object System.Drawing.Point(216, 148)
 $shortcutButton.BackColor = $script:ColorSurface
 $backupsBox.Controls.Add($shortcutButton)
 
 $restoreButton = New-Object System.Windows.Forms.Button
 $restoreButton.Text = '恢复选中备份'
 $restoreButton.Size = New-Object System.Drawing.Size(144, 34)
-$restoreButton.Location = New-Object System.Drawing.Point(12, 196)
+$restoreButton.Location = New-Object System.Drawing.Point(12, 194)
 $restoreButton.ForeColor = $script:ColorDanger
 $restoreButton.BackColor = $script:ColorSurface
 $backupsBox.Controls.Add($restoreButton)
@@ -667,16 +704,31 @@ $backupsBox.Controls.Add($restoreButton)
 $restoreLatestButton = New-Object System.Windows.Forms.Button
 $restoreLatestButton.Text = '恢复最新备份'
 $restoreLatestButton.Size = New-Object System.Drawing.Size(144, 34)
-$restoreLatestButton.Location = New-Object System.Drawing.Point(168, 196)
+$restoreLatestButton.Location = New-Object System.Drawing.Point(168, 194)
 $restoreLatestButton.ForeColor = $script:ColorDanger
 $restoreLatestButton.BackColor = $script:ColorSurface
 $backupsBox.Controls.Add($restoreLatestButton)
 
+$restoreLatestTrashButton = New-Object System.Windows.Forms.Button
+$restoreLatestTrashButton.Text = '恢复最新删除'
+$restoreLatestTrashButton.Size = New-Object System.Drawing.Size(144, 34)
+$restoreLatestTrashButton.Location = New-Object System.Drawing.Point(12, 242)
+$restoreLatestTrashButton.ForeColor = $script:ColorWarning
+$restoreLatestTrashButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($restoreLatestTrashButton)
+
+$openTrashButton = New-Object System.Windows.Forms.Button
+$openTrashButton.Text = '打开回收站'
+$openTrashButton.Size = New-Object System.Drawing.Size(144, 34)
+$openTrashButton.Location = New-Object System.Drawing.Point(168, 242)
+$openTrashButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($openTrashButton)
+
 $providersBox = New-Object System.Windows.Forms.GroupBox
 $providersBox.Text = 'Provider 统计'
 $providersBox.ForeColor = $script:ColorText
-$providersBox.Location = New-Object System.Drawing.Point(814, 510)
-$providersBox.Size = New-Object System.Drawing.Size(326, 166)
+$providersBox.Location = New-Object System.Drawing.Point(814, 584)
+$providersBox.Size = New-Object System.Drawing.Size(326, 132)
 $form.Controls.Add($providersBox)
 
 $providersView = New-Object System.Windows.Forms.ListView
@@ -719,14 +771,8 @@ $candidateList.Add_ItemChecked({
 
 $candidateList.Add_ItemCheck({
   param($Sender, $EventArgs)
-
-  $item = $candidateList.Items[$EventArgs.Index]
-  $threadId = [string]$item.Tag
-  $row = $script:CandidateMap[$threadId]
-  if ($row -and -not $row.can_sync -and $EventArgs.NewValue -eq [System.Windows.Forms.CheckState]::Checked) {
-    $EventArgs.NewValue = [System.Windows.Forms.CheckState]::Unchecked
-    Append-Log "当前会话不可同步，已跳过: $threadId"
-  }
+  # Checkboxes are shared by sync and delete. Sync filters to can_sync rows;
+  # delete can use any checked row.
 })
 
 $form.Add_Shown({
@@ -755,12 +801,59 @@ $selectDefaultButton.Add_Click({
 
 $selectAllButton.Add_Click({
   Set-AllCandidatesChecked $true
-  Append-Log "已全选当前列表中的 $($candidateList.Items.Count) 个会话（最多 $script:CandidateListLimit 条）。"
+  Append-Log "已勾选当前列表中的 $($candidateList.Items.Count) 个会话（同步会自动过滤不可同步会话，删除会使用全部勾选会话）。"
 })
 
 $clearSelectionButton.Add_Click({
   Set-AllCandidatesChecked $false
   Append-Log '已清空会话选择。'
+})
+
+$trashSelectedRowsButton.Add_Click({
+  try {
+    if (-not $script:LatestState) {
+      Refresh-State
+    }
+    $checkedIds = Get-CheckedCandidateIds
+    $rowIds = Get-SelectedRowIds
+    $idSet = @{}
+    foreach ($threadId in @($checkedIds)) {
+      if ($threadId) { $idSet[[string]$threadId] = $true }
+    }
+    foreach ($threadId in @($rowIds)) {
+      if ($threadId) { $idSet[[string]$threadId] = $true }
+    }
+    $selectedIds = @($idSet.Keys | ForEach-Object { [string]$_ })
+    if ($selectedIds.Count -le 0) {
+      [System.Windows.Forms.MessageBox]::Show('请先在会话列表里勾选或选中至少一个会话。', '未选择会话', 'OK', 'Information') | Out-Null
+      Append-Log '删除跳过：没有勾选或选中的会话。'
+      return
+    }
+
+    $message = "请先关闭 Codex Desktop，再继续删除。`r`n`r`n将会把选中的会话移入可恢复回收站，而不是永久删除。`r`n本次选中会话数: $($selectedIds.Count)`r`n`r`n如误删，可使用'恢复最新删除'。"
+    if (-not (Confirm-Action -Message $message -Title '确认移入回收站')) {
+      Append-Log '用户取消了删除。'
+      return
+    }
+
+    $backendArgs = New-Object System.Collections.Generic.List[string]
+    [void]$backendArgs.Add('--json')
+    [void]$backendArgs.Add('trash')
+    foreach ($threadId in $selectedIds) {
+      [void]$backendArgs.Add('--thread-id')
+      [void]$backendArgs.Add([string]$threadId)
+    }
+
+    $result = Invoke-Backend -Arguments ($backendArgs.ToArray())
+    Append-Log "已移入回收站。删除线程: $($result.deleted_rows)，移动 rollout 文件: $($result.moved_rollout_files)"
+    Append-Log "回收站快照: $($result.trash_path)"
+    Append-Log "删除前安全备份: $($result.safety_backup)"
+    Refresh-State
+    [System.Windows.Forms.MessageBox]::Show('已移入回收站。若 Codex 历史列表没有立刻刷新，重开一次 Codex 即可。', '删除完成', 'OK', 'Information') | Out-Null
+  } catch {
+    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '删除失败', 'OK', 'Error') | Out-Null
+    Append-Log "删除失败: $($_.Exception.Message)"
+  }
 })
 
 $syncButton.Add_Click({
@@ -770,11 +863,13 @@ $syncButton.Add_Click({
     }
     $selectedIds = Get-SelectedCandidateIds
     if ($selectedIds.Count -le 0) {
-      [System.Windows.Forms.MessageBox]::Show('请先在“可找回会话”里勾选至少一个会话。', '未选择会话', 'OK', 'Information') | Out-Null
+      [System.Windows.Forms.MessageBox]::Show('请先勾选至少一个“可同步”会话。当前会话可以勾选用于删除，但不会参与同步。', '未选择可同步会话', 'OK', 'Information') | Out-Null
       Append-Log '同步跳过：没有选中的可找回会话。'
       return
     }
-    $message = "请先关闭 Codex Desktop，再继续同步。`r`n`r`n将会把选中的旧会话挂到当前设置:`r`nprovider: $($script:LatestState.current_provider)`r`nmodel: $($script:LatestState.current_model)`r`n`r`n本次选中会话数: $($selectedIds.Count)`r`n每次都会先自动备份数据库和受影响的 rollout 元数据文件。"
+    $targetProviderDisplay = if ($script:LatestState.current_provider_display) { [string]$script:LatestState.current_provider_display } else { [string]$script:LatestState.current_provider }
+    $targetProfileKind = if ($script:LatestState.target_provider_profile) { [string]$script:LatestState.target_provider_profile.kind } else { 'legacy' }
+    $message = "请先关闭 Codex Desktop，再继续同步。`r`n`r`n将会把选中的旧会话挂到当前设置:`r`nprovider: $targetProviderDisplay`r`nprovider 形态: $targetProfileKind`r`nmodel: $($script:LatestState.current_model)`r`n`r`n本次选中会话数: $($selectedIds.Count)`r`n每次都会先自动备份数据库和受影响的 rollout 元数据文件。"
     if (-not (Confirm-Action -Message $message -Title '确认同步')) {
       Append-Log '用户取消了同步。'
       return
@@ -889,6 +984,42 @@ $restoreLatestButton.Add_Click({
   } catch {
     [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '恢复失败', 'OK', 'Error') | Out-Null
     Append-Log "恢复失败: $($_.Exception.Message)"
+  }
+})
+
+$restoreLatestTrashButton.Add_Click({
+  try {
+    if (-not (Confirm-Action -Message '请先关闭 Codex Desktop，再继续恢复。将会恢复最新一次删除的会话，并在恢复前再做一次安全快照。' -Title '确认恢复最新删除')) {
+      Append-Log '用户取消了恢复最新删除。'
+      return
+    }
+
+    $result = Invoke-Backend @('--json', 'restore-trash')
+    Append-Log "已恢复最新删除: $($result.restored_from)"
+    Append-Log "恢复线程: $($result.restored_rows)，恢复 rollout 文件: $($result.restored_rollout_files)，冲突: $($result.rollout_conflicts)"
+    Append-Log "恢复前安全快照: $($result.safety_backup)"
+    Refresh-State
+    [System.Windows.Forms.MessageBox]::Show('恢复完成。建议重开一次 Codex 再看历史列表。', '恢复完成', 'OK', 'Information') | Out-Null
+  } catch {
+    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '恢复删除失败', 'OK', 'Error') | Out-Null
+    Append-Log "恢复删除失败: $($_.Exception.Message)"
+  }
+})
+
+$openTrashButton.Add_Click({
+  try {
+    if (-not $script:LatestState) {
+      Refresh-State
+    }
+    $folder = $script:LatestState.trash_dir
+    if (-not (Test-Path -LiteralPath $folder)) {
+      New-Item -ItemType Directory -Force -Path $folder | Out-Null
+    }
+    Start-Process explorer.exe $folder
+    Append-Log "已打开回收站目录: $folder"
+  } catch {
+    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '打开回收站失败', 'OK', 'Error') | Out-Null
+    Append-Log "打开回收站失败: $($_.Exception.Message)"
   }
 })
 
