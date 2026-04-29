@@ -369,6 +369,9 @@ class SyncBackendTests(unittest.TestCase):
             old_rollout = write_rollout(codex_home, "old-provider-old-model", "old_provider", "gpt-old")
             current_rollout = write_rollout(codex_home, "already-current", "new_provider", "gpt-new")
             unrelated_rollout = write_rollout(codex_home, "not-in-db", "old_provider", "gpt-old", archived=True)
+            original_mtime_ns = 1_234_567_890_123_456_789
+            os.utime(old_rollout, ns=(original_mtime_ns, original_mtime_ns))
+            expected_mtime_ns = old_rollout.stat().st_mtime_ns
             paths = resolve_paths(str(codex_home))
 
             status = get_status(paths)
@@ -388,6 +391,7 @@ class SyncBackendTests(unittest.TestCase):
             self.assertEqual(old_lines[1]["payload"]["text"], "keep me unchanged")
             self.assertEqual(current_lines[0]["payload"]["model_provider"], "new_provider")
             self.assertEqual(unrelated_lines[0]["payload"]["model_provider"], "old_provider")
+            self.assertEqual(old_rollout.stat().st_mtime_ns, expected_mtime_ns)
 
             status_after = get_status(paths)
             self.assertEqual(status_after["rollout_db_mismatch_threads"], 0)

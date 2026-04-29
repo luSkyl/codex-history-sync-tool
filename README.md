@@ -14,7 +14,7 @@
 - 显示当前目标 Provider Profile，区分 `named_provider` 和 `official_providerless`
 - 列出可找回的旧 provider / model 会话，按 Codex 会话活动时间倒序排列
 - 图形界面会同时展示当前 provider / model 会话，但这些当前会话只读展示、不可勾选同步
-- 图形界面一次最多加载 1000 个可找回会话，默认勾选最新 20 个
+- 图形界面一次最多加载 1000 个可找回会话，批量选择数量默认 20，可自行改成任意 1-1000 的数量
 - 把选中的旧会话同步到当前设置，同时同步匹配线程的 rollout `session_meta`
 - 把任意选中的会话移入可恢复回收站
 - 按天数预览或清理老会话
@@ -74,7 +74,7 @@ py -3 .\sync_backend.py --json status
 py -3 .\sync_backend.py --json codex-running
 ```
 
-图形界面在同步、删除和恢复前也会自动检测。如果检测到 Codex 相关进程正在运行，会先弹出二次确认。
+图形界面在同步、删除和恢复前也会自动检测。如果检测到 Codex 相关进程正在运行，会阻止这些写操作；请先关闭 Codex Desktop 或相关 Codex 窗口后重试。
 
 ### 查看可找回会话
 
@@ -175,10 +175,11 @@ py -3 -m unittest discover -s tests -v
 
 ## 使用建议
 
-- 执行同步或恢复前请先关闭 Codex Desktop；如果 Codex 同时运行，它可能继续写入数据库，导致同步不完整或恢复结果被覆盖
-- 图形界面默认加载最多 1000 个会话行，按 Codex 会话活动时间倒序排列；默认不勾选任何会话，需要手动点击“默认最新20”或自行选择
-- 图形界面的“全选最多1000”只会勾选当前列表里已经加载出来的会话；如果你的可找回会话超过 1000 条，请用命令行 `py -3 .\sync_backend.py --json sync` 执行全量同步
+- 执行同步、删除或恢复前请先关闭 Codex Desktop；如果 Codex 同时运行，它可能继续写入数据库，导致同步不完整或恢复结果被覆盖。图形界面会在检测到 Codex 运行时阻止这些写操作。
+- 图形界面默认加载最多 1000 个会话行，按 Codex 会话活动时间倒序排列；默认不勾选任何会话。可以修改“数量”后点击“勾选最新可同步”从列表前面选择一批用于同步，或点击“勾选最旧”从列表末尾倒序选择一批用于删除。
+- 图形界面的“全选当前列表”只会勾选当前列表里已经加载出来的会话；如果你的可找回会话超过 1000 条，请用命令行 `py -3 .\sync_backend.py --json sync` 执行全量同步
 - 只想同步最近一批时，可以用命令行 `py -3 .\sync_backend.py --json sync --latest N`，例如 `--latest 50`
+- 同步只改会话归属和模型元数据，会保留 rollout 文件原始修改时间，避免旧会话因为刚同步而被误排到最新
 - 如果同步完成后历史列表没有立刻刷新，重开一次 Codex Desktop 即可
 - 官方账号模式下看到“当前 Provider”为“官方账号 / 无 provider”是正常的；这表示工具会按官方账号的无 provider 元数据格式同步，而不是写入一个伪 provider 名称。
 - 第三方 provider 模式下，官方账号形态的本地会话（SQLite `NULL`/空字符串，或 rollout 缺少 `model_provider`）会被识别为可同步，并写回当前 provider 字符串。
@@ -194,7 +195,7 @@ py -3 -m unittest discover -s tests -v
 
 ### 为什么同步、删除或恢复前要关闭 Codex Desktop？
 
-Codex 或 Codex Desktop 可能会同时写入 `state_5.sqlite`，或从 rollout 文件重建部分状态。如果它正在运行，刚同步或恢复的内容可能被运行中的 Codex 覆盖。图形界面会主动检测运行中的 Codex，并在继续前提示。
+Codex 或 Codex Desktop 可能会同时写入 `state_5.sqlite`，或从 rollout 文件重建部分状态。如果它正在运行，刚同步、删除或恢复的内容可能被运行中的 Codex 覆盖。图形界面会主动检测运行中的 Codex，并阻止同步、删除和恢复这些写操作。
 
 ### 为什么有些会话显示“当前”，不能同步？
 

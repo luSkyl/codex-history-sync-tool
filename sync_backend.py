@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -644,6 +645,7 @@ def newline_for_line(line: str) -> str:
 
 
 def rewrite_rollout_meta(path: Path, target_profile: TargetProviderProfile, current_model: str | None) -> bool:
+    original_stat = path.stat()
     text = read_jsonl_text(path)
     lines = text.splitlines(keepends=True)
     changed = False
@@ -661,6 +663,7 @@ def rewrite_rollout_meta(path: Path, target_profile: TargetProviderProfile, curr
     if not changed:
         return False
     path.write_text("".join(lines), encoding="utf-8")
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
     return True
 
 

@@ -282,16 +282,68 @@ function Refresh-Candidates {
   Render-Candidates $false
 }
 
-function Select-DefaultCandidates {
-  if (-not $script:LatestCandidates) {
-    return
+function Get-BatchSelectionCount {
+  if (-not $batchCountInput) {
+    return 20
+  }
+  return [int]$batchCountInput.Value
+}
+
+function Select-LatestSyncCandidates {
+  param([int]$Count)
+
+  if ($Count -le 0) {
+    $script:CandidateCheckedIds = @{}
+    Render-Candidates $false
+    return 0
   }
 
   $script:CandidateCheckedIds = @{}
-  foreach ($id in @($script:LatestCandidates.default_selected_thread_ids)) {
-    $script:CandidateCheckedIds[[string]$id] = $true
+  $selected = 0
+  foreach ($item in $candidateList.Items) {
+    if ($selected -ge $Count) {
+      break
+    }
+
+    $threadId = [string]$item.Tag
+    if (-not $threadId) {
+      continue
+    }
+
+    $row = $script:CandidateMap[$threadId]
+    if ($row -and $row.can_sync) {
+      $script:CandidateCheckedIds[$threadId] = $true
+      $selected++
+    }
   }
   Render-Candidates $false
+  return $selected
+}
+
+function Select-OldestCandidates {
+  param([int]$Count)
+
+  if ($Count -le 0) {
+    $script:CandidateCheckedIds = @{}
+    Render-Candidates $false
+    return 0
+  }
+
+  $script:CandidateCheckedIds = @{}
+  $selected = 0
+  for ($index = $candidateList.Items.Count - 1; $index -ge 0; $index--) {
+    if ($selected -ge $Count) {
+      break
+    }
+
+    $threadId = [string]$candidateList.Items[$index].Tag
+    if ($threadId) {
+      $script:CandidateCheckedIds[$threadId] = $true
+      $selected++
+    }
+  }
+  Render-Candidates $false
+  return $selected
 }
 
 function Set-AllCandidatesChecked {
@@ -430,22 +482,24 @@ function Confirm-CodexClosed {
     }
 
     $processText = (($state.processes | ForEach-Object { "$($_.image_name) (PID $($_.pid))" }) -join "`r`n")
-    $message = "检测到 Codex 相关进程可能仍在运行。`r`n`r`n$processText`r`n`r`n继续 $OperationName 可能被 Codex 正在写入的状态覆盖。建议先关闭 Codex Desktop 或相关 Codex 窗口。`r`n`r`n仍要继续吗？"
-    $choice = [System.Windows.Forms.MessageBox]::Show(
+    $message = "检测到 Codex 相关进程仍在运行。`r`n`r`n$processText`r`n`r`n为避免 Codex 正在写入的状态覆盖本次结果，已阻止 $OperationName。请先关闭 Codex Desktop 或相关 Codex 窗口后重试。"
+    [System.Windows.Forms.MessageBox]::Show(
       $message,
-      'Codex 正在运行',
-      [System.Windows.Forms.MessageBoxButtons]::YesNo,
+      '请先关闭 Codex',
+      [System.Windows.Forms.MessageBoxButtons]::OK,
       [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
-    if ($choice -ne [System.Windows.Forms.DialogResult]::Yes) {
-      Append-Log "$OperationName 已取消：Codex 相关进程仍在运行。"
-      return $false
-    }
-    Append-Log "$OperationName 继续执行：用户确认忽略 Codex 运行提示。"
-    return $true
+    ) | Out-Null
+    Append-Log "$OperationName 已阻止：Codex 相关进程仍在运行。"
+    return $false
   } catch {
     Append-Log "Codex 运行检测失败: $($_.Exception.Message)"
-    return $true
+    [System.Windows.Forms.MessageBox]::Show(
+      "无法确认 Codex 是否已关闭。为避免写入冲突，已阻止 $OperationName。`r`n`r`n错误: $($_.Exception.Message)",
+      'Codex 运行检测失败',
+      [System.Windows.Forms.MessageBoxButtons]::OK,
+      [System.Windows.Forms.MessageBoxIcon]::Warning
+    ) | Out-Null
+    return $false
   }
 }
 
@@ -652,31 +706,53 @@ $candidateSummaryLabel.AutoSize = $true
 $candidateSummaryLabel.Location = New-Object System.Drawing.Point(12, 24)
 $candidateBox.Controls.Add($candidateSummaryLabel)
 
-$selectDefaultButton = New-Object System.Windows.Forms.Button
-$selectDefaultButton.Text = '默认最新20'
-$selectDefaultButton.Size = New-Object System.Drawing.Size(100, 30)
-$selectDefaultButton.Location = New-Object System.Drawing.Point(12, 54)
-$selectDefaultButton.BackColor = $script:ColorSurface
-$candidateBox.Controls.Add($selectDefaultButton)
+$batchCountLabel = New-Object System.Windows.Forms.Label
+$batchCountLabel.Text = '数量'
+$batchCountLabel.AutoSize = $true
+$batchCountLabel.ForeColor = $script:ColorMuted
+$batchCountLabel.Location = New-Object System.Drawing.Point(12, 61)
+$candidateBox.Controls.Add($batchCountLabel)
+
+$batchCountInput = New-Object System.Windows.Forms.NumericUpDown
+$batchCountInput.Minimum = 1
+$batchCountInput.Maximum = 1000
+$batchCountInput.Value = 20
+$batchCountInput.Size = New-Object System.Drawing.Size(54, 24)
+$batchCountInput.Location = New-Object System.Drawing.Point(46, 56)
+$candidateBox.Controls.Add($batchCountInput)
+
+$selectLatestSyncButton = New-Object System.Windows.Forms.Button
+$selectLatestSyncButton.Text = '勾选最新可同步'
+$selectLatestSyncButton.Size = New-Object System.Drawing.Size(126, 30)
+$selectLatestSyncButton.Location = New-Object System.Drawing.Point(108, 54)
+$selectLatestSyncButton.BackColor = $script:ColorSurface
+$candidateBox.Controls.Add($selectLatestSyncButton)
+
+$selectOldestButton = New-Object System.Windows.Forms.Button
+$selectOldestButton.Text = '勾选最旧'
+$selectOldestButton.Size = New-Object System.Drawing.Size(80, 30)
+$selectOldestButton.Location = New-Object System.Drawing.Point(242, 54)
+$selectOldestButton.BackColor = $script:ColorSurface
+$candidateBox.Controls.Add($selectOldestButton)
 
 $selectAllButton = New-Object System.Windows.Forms.Button
 $selectAllButton.Text = '全选当前列表'
-$selectAllButton.Size = New-Object System.Drawing.Size(118, 30)
-$selectAllButton.Location = New-Object System.Drawing.Point(124, 54)
+$selectAllButton.Size = New-Object System.Drawing.Size(106, 30)
+$selectAllButton.Location = New-Object System.Drawing.Point(330, 54)
 $selectAllButton.BackColor = $script:ColorSurface
 $candidateBox.Controls.Add($selectAllButton)
 
 $clearSelectionButton = New-Object System.Windows.Forms.Button
 $clearSelectionButton.Text = '清空选择'
-$clearSelectionButton.Size = New-Object System.Drawing.Size(90, 30)
-$clearSelectionButton.Location = New-Object System.Drawing.Point(254, 54)
+$clearSelectionButton.Size = New-Object System.Drawing.Size(84, 30)
+$clearSelectionButton.Location = New-Object System.Drawing.Point(444, 54)
 $clearSelectionButton.BackColor = $script:ColorSurface
 $candidateBox.Controls.Add($clearSelectionButton)
 
 $trashSelectedRowsButton = New-Object System.Windows.Forms.Button
 $trashSelectedRowsButton.Text = '删除选中行'
 $trashSelectedRowsButton.Size = New-Object System.Drawing.Size(104, 30)
-$trashSelectedRowsButton.Location = New-Object System.Drawing.Point(356, 54)
+$trashSelectedRowsButton.Location = New-Object System.Drawing.Point(536, 54)
 $trashSelectedRowsButton.ForeColor = $script:ColorDanger
 $trashSelectedRowsButton.BackColor = $script:ColorSurface
 $candidateBox.Controls.Add($trashSelectedRowsButton)
@@ -849,9 +925,16 @@ $refreshButton.Add_Click({
   }
 })
 
-$selectDefaultButton.Add_Click({
-  Select-DefaultCandidates
-  Append-Log '已恢复默认选择：最新 20 个可找回会话。'
+$selectLatestSyncButton.Add_Click({
+  $count = Get-BatchSelectionCount
+  $selected = Select-LatestSyncCandidates $count
+  Append-Log "已从当前显示列表前面勾选最新可同步会话 $selected/$count 个。"
+})
+
+$selectOldestButton.Add_Click({
+  $count = Get-BatchSelectionCount
+  $selected = Select-OldestCandidates $count
+  Append-Log "已从当前显示列表末尾倒序勾选最旧会话 $selected/$count 个，可点击删除选中行移入回收站。"
 })
 
 $selectAllButton.Add_Click({
