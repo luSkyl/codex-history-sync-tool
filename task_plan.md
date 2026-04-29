@@ -18,6 +18,7 @@ Goal: Fix Codex history sync so newer Codex Desktop history metadata stays consi
 - [complete] Prevent current-account active sessions from being selected or synced when stale provider metadata remains.
 - [complete] Upgrade provider handling to a bidirectional Provider Profile abstraction.
 - [complete] Add recoverable trash-first deletion for arbitrary and old sessions.
+- [complete] Add closeout reliability polish: Codex process detection, trash snapshot pruning, and README FAQ.
 
 ## Decisions
 
@@ -32,6 +33,8 @@ Goal: Fix Codex history sync so newer Codex Desktop history metadata stays consi
 - Use `config.toml`/`auth.json` modification time as the current account activation guard; provider/model-mismatched sessions updated after that point are shown as current and excluded from backend sync.
 - Use `TargetProviderProfile` as the sync contract: `named_provider` writes provider strings to SQLite/rollout, while `official_providerless` writes schema-safe empty/NULL DB values and omits rollout provider fields.
 - Delete operations must be recoverable by default: store SQLite rows and moved rollout files in `history_sync_trash`, and create a safety backup before mutating the live DB.
+- Dangerous operations should actively warn when Codex Desktop appears to be running, while still leaving the final choice to the user.
+- Trash cleanup should support dry-run preview first and prune only valid trash snapshots older than the requested retention window.
 
 ## Errors Encountered
 

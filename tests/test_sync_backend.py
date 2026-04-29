@@ -6,12 +6,15 @@ import tempfile
 import unittest
 import json
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 from sync_backend import (
     get_status,
     get_sync_candidates,
     make_backup,
+    parse_tasklist_processes,
+    prune_trash,
     resolve_paths,
     restore_backup,
     restore_trash,
@@ -162,6 +165,14 @@ def read_rollout_lines(path: Path) -> list[dict[str, object]]:
 
 
 class SyncBackendTests(unittest.TestCase):
+    def test_parse_tasklist_processes_reads_csv_rows(self) -> None:
+        output = '"Codex.exe","1234","Console","1","100,000 K"\n"python.exe","5678","Console","1","50,000 K"\n'
+
+        processes = parse_tasklist_processes(output)
+
+        self.assertEqual(processes[0], {"image_name": "Codex.exe", "pid": 1234})
+        self.assertEqual(processes[1], {"image_name": "python.exe", "pid": 5678})
+
     def test_providerless_official_account_syncs_to_null_provider_and_omits_rollout_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir)
@@ -748,6 +759,37 @@ class SyncBackendTests(unittest.TestCase):
             with closing(sqlite3.connect(codex_home / "state_5.sqlite")) as conn:
                 remaining_count = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
             self.assertEqual(remaining_count, 3)
+
+    def test_prune_trash_supports_preview_and_deletes_only_old_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home)
+            create_threads_db(codex_home, with_model=True)
+            paths = resolve_paths(str(codex_home))
+
+            old_result = trash_sessions(paths, ["old-provider-old-model"])
+            old_trash_path = Path(str(old_result["trash_path"]))
+            old_timestamp = datetime.now().timestamp() - (100 * 24 * 60 * 60)
+            os.utime(old_trash_path, (old_timestamp, old_timestamp))
+
+            recent_result = trash_sessions(paths, ["new-provider-old-model"])
+            recent_trash_path = Path(str(recent_result["trash_path"]))
+
+            preview = prune_trash(paths, older_than_days=90, dry_run=True)
+
+            self.assertEqual(preview["action"], "prune-trash-preview")
+            self.assertEqual(preview["trash_count"], 1)
+            self.assertEqual(preview["trash"][0]["path"], str(old_trash_path))
+            self.assertTrue(old_trash_path.exists())
+            self.assertTrue(recent_trash_path.exists())
+
+            result = prune_trash(paths, older_than_days=90)
+
+            self.assertEqual(result["action"], "prune-trash")
+            self.assertEqual(result["deleted_count"], 1)
+            self.assertFalse(old_trash_path.exists())
+            self.assertTrue(recent_trash_path.exists())
+            self.assertEqual([item["path"] for item in list_trash(paths)], [str(recent_trash_path)])
 
 
 if __name__ == "__main__":

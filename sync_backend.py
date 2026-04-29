@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import re
 import sqlite3
+import subprocess
 import shutil
 from collections import Counter, OrderedDict
 from collections.abc import Iterable, Iterator
@@ -18,6 +20,7 @@ TRASH_VERSION = 1
 DEFAULT_SELECTED_CANDIDATES = 20
 DEFAULT_CANDIDATE_LIST_LIMIT = 1000
 PROVIDERLESS_DISPLAY = "官方账号 / 无 provider"
+CODEX_PROCESS_NAMES = {"codex.exe", "codex desktop.exe"}
 
 
 def default_codex_home() -> Path:
@@ -114,6 +117,61 @@ def provider_mismatch_condition(current_provider: str | None) -> tuple[str, list
     if is_providerless_value(current_provider):
         return "model_provider IS NOT NULL AND model_provider <> ''", []
     return "model_provider IS NULL OR model_provider = '' OR model_provider <> ?", [current_provider]
+
+
+def parse_tasklist_processes(output: str) -> list[dict[str, object]]:
+    processes = []
+    for row in csv.reader(output.splitlines()):
+        if len(row) < 2:
+            continue
+        image_name = row[0].strip()
+        pid_text = row[1].strip()
+        try:
+            pid: int | str = int(pid_text)
+        except ValueError:
+            pid = pid_text
+        processes.append({"image_name": image_name, "pid": pid})
+    return processes
+
+
+def running_codex_processes() -> dict[str, object]:
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        return {
+            "action": "codex-running",
+            "running": False,
+            "process_count": 0,
+            "processes": [],
+            "error": str(exc),
+        }
+    if completed.returncode != 0:
+        return {
+            "action": "codex-running",
+            "running": False,
+            "process_count": 0,
+            "processes": [],
+            "error": completed.stderr.strip() or completed.stdout.strip(),
+        }
+
+    processes = [
+        process
+        for process in parse_tasklist_processes(completed.stdout)
+        if str(process["image_name"]).lower() in CODEX_PROCESS_NAMES
+    ]
+    return {
+        "action": "codex-running",
+        "running": bool(processes),
+        "process_count": len(processes),
+        "processes": processes,
+    }
 
 
 def build_target_provider_profile(config_provider: str | None, provider_column_not_null: bool) -> TargetProviderProfile:
@@ -1464,6 +1522,80 @@ def list_trash(paths: Paths, limit: int = 20) -> list[dict[str, object]]:
     return output
 
 
+def directory_size_bytes(path: Path) -> int:
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def old_trash_items(paths: Paths, older_than_days: int) -> list[dict[str, object]]:
+    if older_than_days <= 0:
+        raise RuntimeError("--older-than-days must be greater than 0.")
+    if not paths.trash_dir.exists():
+        return []
+
+    cutoff_ts = datetime.now().timestamp() - (older_than_days * 24 * 60 * 60)
+    trash_root = paths.trash_dir.resolve()
+    items = []
+    for item in sorted(paths.trash_dir.iterdir(), key=lambda candidate: candidate.stat().st_mtime):
+        if not is_trash_item(item) or item.stat().st_mtime >= cutoff_ts:
+            continue
+        try:
+            item.resolve().relative_to(trash_root)
+            manifest = read_trash_manifest(item)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+            continue
+        threads = manifest.get("threads") if isinstance(manifest.get("threads"), list) else []
+        rollouts = manifest.get("rollout_files") if isinstance(manifest.get("rollout_files"), list) else []
+        items.append(
+            {
+                "name": item.name,
+                "path": str(item),
+                "modified_at": datetime.fromtimestamp(item.stat().st_mtime).isoformat(timespec="seconds"),
+                "thread_count": len(threads),
+                "rollout_file_count": len(rollouts),
+                "size_bytes": directory_size_bytes(item),
+            }
+        )
+    return items
+
+
+def prune_trash(paths: Paths, older_than_days: int, dry_run: bool = False) -> dict[str, object]:
+    selected_items = old_trash_items(paths, older_than_days)
+    total_bytes = sum(int(item["size_bytes"]) for item in selected_items)
+    if dry_run:
+        return {
+            "action": "prune-trash-preview",
+            "older_than_days": older_than_days,
+            "trash_count": len(selected_items),
+            "reclaimable_bytes": total_bytes,
+            "trash": selected_items,
+        }
+
+    trash_root = paths.trash_dir.resolve()
+    deleted = []
+    for item in selected_items:
+        item_path = Path(str(item["path"]))
+        try:
+            item_path.resolve().relative_to(trash_root)
+        except ValueError as exc:
+            raise RuntimeError(f"Refusing to prune trash outside trash directory: {item_path}") from exc
+        shutil.rmtree(item_path)
+        deleted.append(item)
+    return {
+        "action": "prune-trash",
+        "older_than_days": older_than_days,
+        "deleted_count": len(deleted),
+        "reclaimed_bytes": sum(int(item["size_bytes"]) for item in deleted),
+        "trash": deleted,
+    }
+
+
 def resolve_trash(paths: Paths, requested_path: str | None) -> Path:
     if requested_path:
         trash_path = Path(requested_path).expanduser()
@@ -1569,6 +1701,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("codex-running", help="Check whether Codex Desktop appears to be running")
     subparsers.add_parser("status", help="Show current provider/thread status")
     candidates_parser = subparsers.add_parser("list-candidates", help="List threads that can be moved to current settings")
     candidates_parser.add_argument("--limit", type=int, default=DEFAULT_CANDIDATE_LIST_LIMIT)
@@ -1587,12 +1720,17 @@ def main() -> int:
     trash_list_parser.add_argument("--limit", type=int, default=20)
     restore_trash_parser = subparsers.add_parser("restore-trash", help="Restore from a trash snapshot")
     restore_trash_parser.add_argument("--trash", help="Trash snapshot path; newest trash is used when omitted")
+    prune_trash_parser = subparsers.add_parser("prune-trash", help="Delete old recoverable trash snapshots")
+    prune_trash_parser.add_argument("--older-than-days", type=int, required=True, help="Prune trash snapshots older than N days")
+    prune_trash_parser.add_argument("--dry-run", action="store_true", help="Preview trash snapshot pruning")
 
     args = parser.parse_args()
     paths = resolve_paths(args.codex_home)
 
     try:
-        if args.command == "status":
+        if args.command == "codex-running":
+            payload = running_codex_processes()
+        elif args.command == "status":
             payload = get_status(paths)
         elif args.command == "list-candidates":
             payload = get_sync_candidates(paths, limit=args.limit, include_current=args.include_current)
@@ -1620,6 +1758,8 @@ def main() -> int:
             payload = {"action": "list-trash", "trash": list_trash(paths, limit=args.limit)}
         elif args.command == "restore-trash":
             payload = restore_trash(paths, args.trash)
+        elif args.command == "prune-trash":
+            payload = prune_trash(paths, args.older_than_days, dry_run=args.dry_run)
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except Exception as exc:

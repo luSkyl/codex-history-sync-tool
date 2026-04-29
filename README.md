@@ -19,6 +19,8 @@
 - 把任意选中的会话移入可恢复回收站
 - 按天数预览或清理老会话
 - 从最新或指定回收站快照恢复误删会话
+- 检测 Codex Desktop 是否仍在运行，并在危险操作前提示
+- 预览或清理过期回收站快照
 - 在同步前自动创建数据库和受影响 rollout 文件快照
 - 从备份快照恢复数据库和 rollout 文件
 - 提供一个可直接点击的 Windows 图形界面
@@ -65,6 +67,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -InstallShor
 ```powershell
 py -3 .\sync_backend.py --json status
 ```
+
+### 检查 Codex 是否仍在运行
+
+```powershell
+py -3 .\sync_backend.py --json codex-running
+```
+
+图形界面在同步、删除和恢复前也会自动检测。如果检测到 Codex 相关进程正在运行，会先弹出二次确认。
 
 ### 查看可找回会话
 
@@ -126,6 +136,15 @@ py -3 .\sync_backend.py --json restore-trash
 py -3 .\sync_backend.py --json restore-trash --trash <trash-snapshot-path>
 ```
 
+### 预览与清理过期回收站
+
+```powershell
+py -3 .\sync_backend.py --json prune-trash --older-than-days 90 --dry-run
+py -3 .\sync_backend.py --json prune-trash --older-than-days 90
+```
+
+`--dry-run` 只预览将被删除的回收站快照和预计释放空间；去掉 `--dry-run` 才会真正删除这些快照。图形界面的“清理回收站”默认清理 90 天前的回收站快照，并且会先预览再确认。
+
 ### 手动创建备份
 
 ```powershell
@@ -166,6 +185,24 @@ py -3 -m unittest discover -s tests -v
 - 当前账号切换后仍在活动的会话会被视为“当前”并禁止同步；这是为了避免把本账号下的新会话误当成旧 provider 会话迁移。
 - 新版 Codex Desktop 可能会同时参考 `state_5.sqlite` 和 `sessions` / `archived_sessions` 下的 `rollout-*.jsonl`。本工具会按线程 ID 匹配 rollout 的 `session_meta.payload.id`，只改对应的 `session_meta` 和结构化 `turn_context` 里的 provider/model 元数据，不改聊天正文事件。
 - 新版 Codex 可能还会按当前项目目录显示历史。如果同步后仍然看不到旧对话，先确认是否打开了旧对话原来的项目目录；本工具默认不会批量改写线程的 `cwd` 项目归属。
+
+## 常见问题
+
+### 回收站目录需要我手动删除吗？
+
+不需要。删除会话时生成的 `%USERPROFILE%\\.codex\\history_sync_trash` 快照是为了恢复误删会话。确认不再需要恢复旧删除记录时，可以用“清理回收站”或 `prune-trash --older-than-days N` 清理过期快照。
+
+### 为什么同步、删除或恢复前要关闭 Codex Desktop？
+
+Codex 或 Codex Desktop 可能会同时写入 `state_5.sqlite`，或从 rollout 文件重建部分状态。如果它正在运行，刚同步或恢复的内容可能被运行中的 Codex 覆盖。图形界面会主动检测运行中的 Codex，并在继续前提示。
+
+### 为什么有些会话显示“当前”，不能同步？
+
+这些会话已经属于当前 provider / model，或者在当前账号切换后仍然活跃。工具会把它们作为只读行展示，避免把当前账号的新会话误当成旧会话迁移。
+
+### 同步后还是看不到旧对话怎么办？
+
+先重开 Codex Desktop，再确认你打开的是旧对话原来的项目目录。新版 Codex 可能按项目目录过滤历史；本工具默认只修复 provider / model 元数据，不批量改写线程的 `cwd` 项目归属。
 
 ## 项目文件
 

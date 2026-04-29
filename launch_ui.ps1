@@ -402,6 +402,53 @@ function Confirm-Action {
   return $choice -eq [System.Windows.Forms.DialogResult]::OK
 }
 
+function Format-ByteSize {
+  param([int64]$Bytes)
+
+  if ($Bytes -ge 1GB) {
+    return '{0:N2} GB' -f ($Bytes / 1GB)
+  }
+  if ($Bytes -ge 1MB) {
+    return '{0:N2} MB' -f ($Bytes / 1MB)
+  }
+  if ($Bytes -ge 1KB) {
+    return '{0:N2} KB' -f ($Bytes / 1KB)
+  }
+  return "$Bytes B"
+}
+
+function Confirm-CodexClosed {
+  param([string]$OperationName)
+
+  try {
+    $state = Invoke-Backend @('--json', 'codex-running')
+    if (-not $state.running) {
+      if ($state.error) {
+        Append-Log "Codex 运行检测不可用: $($state.error)"
+      }
+      return $true
+    }
+
+    $processText = (($state.processes | ForEach-Object { "$($_.image_name) (PID $($_.pid))" }) -join "`r`n")
+    $message = "检测到 Codex 相关进程可能仍在运行。`r`n`r`n$processText`r`n`r`n继续 $OperationName 可能被 Codex 正在写入的状态覆盖。建议先关闭 Codex Desktop 或相关 Codex 窗口。`r`n`r`n仍要继续吗？"
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+      $message,
+      'Codex 正在运行',
+      [System.Windows.Forms.MessageBoxButtons]::YesNo,
+      [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($choice -ne [System.Windows.Forms.DialogResult]::Yes) {
+      Append-Log "$OperationName 已取消：Codex 相关进程仍在运行。"
+      return $false
+    }
+    Append-Log "$OperationName 继续执行：用户确认忽略 Codex 运行提示。"
+    return $true
+  } catch {
+    Append-Log "Codex 运行检测失败: $($_.Exception.Message)"
+    return $true
+  }
+}
+
 function New-StatusCard {
   param(
     [string]$Title,
@@ -711,7 +758,7 @@ $backupsBox.Controls.Add($restoreLatestButton)
 
 $restoreLatestTrashButton = New-Object System.Windows.Forms.Button
 $restoreLatestTrashButton.Text = '恢复最新删除'
-$restoreLatestTrashButton.Size = New-Object System.Drawing.Size(144, 34)
+$restoreLatestTrashButton.Size = New-Object System.Drawing.Size(118, 34)
 $restoreLatestTrashButton.Location = New-Object System.Drawing.Point(12, 242)
 $restoreLatestTrashButton.ForeColor = $script:ColorWarning
 $restoreLatestTrashButton.BackColor = $script:ColorSurface
@@ -719,10 +766,18 @@ $backupsBox.Controls.Add($restoreLatestTrashButton)
 
 $openTrashButton = New-Object System.Windows.Forms.Button
 $openTrashButton.Text = '打开回收站'
-$openTrashButton.Size = New-Object System.Drawing.Size(144, 34)
-$openTrashButton.Location = New-Object System.Drawing.Point(168, 242)
+$openTrashButton.Size = New-Object System.Drawing.Size(86, 34)
+$openTrashButton.Location = New-Object System.Drawing.Point(138, 242)
 $openTrashButton.BackColor = $script:ColorSurface
 $backupsBox.Controls.Add($openTrashButton)
+
+$pruneTrashButton = New-Object System.Windows.Forms.Button
+$pruneTrashButton.Text = '清理回收站'
+$pruneTrashButton.Size = New-Object System.Drawing.Size(86, 34)
+$pruneTrashButton.Location = New-Object System.Drawing.Point(228, 242)
+$pruneTrashButton.ForeColor = $script:ColorWarning
+$pruneTrashButton.BackColor = $script:ColorSurface
+$backupsBox.Controls.Add($pruneTrashButton)
 
 $providersBox = New-Object System.Windows.Forms.GroupBox
 $providersBox.Text = 'Provider 统计'
@@ -830,6 +885,10 @@ $trashSelectedRowsButton.Add_Click({
       return
     }
 
+    if (-not (Confirm-CodexClosed '删除会话')) {
+      return
+    }
+
     $message = "请先关闭 Codex Desktop，再继续删除。`r`n`r`n将会把选中的会话移入可恢复回收站，而不是永久删除。`r`n本次选中会话数: $($selectedIds.Count)`r`n`r`n如误删，可使用'恢复最新删除'。"
     if (-not (Confirm-Action -Message $message -Title '确认移入回收站')) {
       Append-Log '用户取消了删除。'
@@ -869,6 +928,10 @@ $syncButton.Add_Click({
     }
     $targetProviderDisplay = if ($script:LatestState.current_provider_display) { [string]$script:LatestState.current_provider_display } else { [string]$script:LatestState.current_provider }
     $targetProfileKind = if ($script:LatestState.target_provider_profile) { [string]$script:LatestState.target_provider_profile.kind } else { 'legacy' }
+    if (-not (Confirm-CodexClosed '同步会话')) {
+      return
+    }
+
     $message = "请先关闭 Codex Desktop，再继续同步。`r`n`r`n将会把选中的旧会话挂到当前设置:`r`nprovider: $targetProviderDisplay`r`nprovider 形态: $targetProfileKind`r`nmodel: $($script:LatestState.current_model)`r`n`r`n本次选中会话数: $($selectedIds.Count)`r`n每次都会先自动备份数据库和受影响的 rollout 元数据文件。"
     if (-not (Confirm-Action -Message $message -Title '确认同步')) {
       Append-Log '用户取消了同步。'
@@ -950,6 +1013,10 @@ $restoreButton.Add_Click({
       throw '无法解析选中的备份路径。'
     }
 
+    if (-not (Confirm-CodexClosed '恢复备份')) {
+      return
+    }
+
     $message = "请先关闭 Codex Desktop，再继续恢复。`r`n`r`n将会恢复这个备份：`r`n$backupPath`r`n`r`n恢复前会再自动生成一份安全快照。"
     if (-not (Confirm-Action -Message $message -Title '确认恢复')) {
       Append-Log '用户取消了恢复。'
@@ -970,6 +1037,10 @@ $restoreButton.Add_Click({
 
 $restoreLatestButton.Add_Click({
   try {
+    if (-not (Confirm-CodexClosed '恢复最新备份')) {
+      return
+    }
+
     if (-not (Confirm-Action -Message '请先关闭 Codex Desktop，再继续恢复。将会恢复最新备份，并在恢复前再做一次安全快照。' -Title '确认恢复最新备份')) {
       Append-Log '用户取消了恢复最新备份。'
       return
@@ -989,6 +1060,10 @@ $restoreLatestButton.Add_Click({
 
 $restoreLatestTrashButton.Add_Click({
   try {
+    if (-not (Confirm-CodexClosed '恢复最新删除')) {
+      return
+    }
+
     if (-not (Confirm-Action -Message '请先关闭 Codex Desktop，再继续恢复。将会恢复最新一次删除的会话，并在恢复前再做一次安全快照。' -Title '确认恢复最新删除')) {
       Append-Log '用户取消了恢复最新删除。'
       return
@@ -1020,6 +1095,34 @@ $openTrashButton.Add_Click({
   } catch {
     [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '打开回收站失败', 'OK', 'Error') | Out-Null
     Append-Log "打开回收站失败: $($_.Exception.Message)"
+  }
+})
+
+$pruneTrashButton.Add_Click({
+  try {
+    $retentionDays = 90
+    $preview = Invoke-Backend @('--json', 'prune-trash', '--older-than-days', ([string]$retentionDays), '--dry-run')
+    $reclaimable = Format-ByteSize ([int64]$preview.reclaimable_bytes)
+    if ([int]$preview.trash_count -le 0) {
+      [System.Windows.Forms.MessageBox]::Show("没有找到 $retentionDays 天前的回收站快照。", '无需清理', 'OK', 'Information') | Out-Null
+      Append-Log "回收站清理预览：没有 $retentionDays 天前的快照。"
+      return
+    }
+
+    $message = "将删除 $retentionDays 天前的回收站快照。`r`n`r`n快照数: $($preview.trash_count)`r`n预计释放: $reclaimable`r`n`r`n删除后这些快照不能再用于恢复。确定继续吗？"
+    if (-not (Confirm-Action -Message $message -Title '确认清理回收站')) {
+      Append-Log '用户取消了回收站清理。'
+      return
+    }
+
+    $result = Invoke-Backend @('--json', 'prune-trash', '--older-than-days', ([string]$retentionDays))
+    $reclaimed = Format-ByteSize ([int64]$result.reclaimed_bytes)
+    Append-Log "回收站清理完成。删除快照: $($result.deleted_count)，释放: $reclaimed"
+    Refresh-State
+    [System.Windows.Forms.MessageBox]::Show("回收站清理完成。`r`n删除快照: $($result.deleted_count)`r`n释放: $reclaimed", '清理完成', 'OK', 'Information') | Out-Null
+  } catch {
+    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '清理回收站失败', 'OK', 'Error') | Out-Null
+    Append-Log "清理回收站失败: $($_.Exception.Message)"
   }
 })
 
