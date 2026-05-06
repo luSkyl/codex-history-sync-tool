@@ -33,6 +33,17 @@ $script:ColorDanger = [System.Drawing.Color]::FromArgb(180, 35, 24)
 $script:ColorCurrentRow = [System.Drawing.Color]::FromArgb(238, 246, 245)
 $script:ColorDisabledText = [System.Drawing.Color]::FromArgb(152, 162, 179)
 
+function Test-JsonProperty {
+  param(
+    [Parameter(Mandatory = $true)]
+    $Object,
+    [Parameter(Mandatory = $true)]
+    [string]$Name
+  )
+
+  return $null -ne $Object.PSObject.Properties[$Name]
+}
+
 function Invoke-Backend {
   param(
     [Parameter(Mandatory = $true)]
@@ -56,8 +67,9 @@ function Invoke-Backend {
     throw "后端 JSON 解析失败。`r`n原始错误: $($_.Exception.Message)`r`n返回内容:`r`n$text"
   }
 
-  if ($exitCode -ne 0 -or -not $json.ok) {
-    if ($json.error) {
+  $isOk = (Test-JsonProperty $json 'ok') -and [bool]$json.ok
+  if ($exitCode -ne 0 -or -not $isOk) {
+    if ((Test-JsonProperty $json 'error') -and $json.error) {
       throw [string]$json.error
     }
     throw "后端执行失败。`r`n$text"
@@ -475,7 +487,7 @@ function Confirm-CodexClosed {
   try {
     $state = Invoke-Backend @('--json', 'codex-running')
     if (-not $state.running) {
-      if ($state.error) {
+      if ((Test-JsonProperty $state 'error') -and $state.error) {
         Append-Log "Codex 运行检测不可用: $($state.error)"
       }
       return $true
@@ -1224,6 +1236,10 @@ try {
 }
 
 if ($SmokeTest) {
+  $smokeJson = [pscustomobject]@{ ok = $true }
+  if (Test-JsonProperty $smokeJson 'error') {
+    throw 'Smoke test failed: missing JSON property was reported as present.'
+  }
   Write-Output 'Smoke test OK'
   exit 0
 }
